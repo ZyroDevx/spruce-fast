@@ -10,6 +10,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 import org.lwjgl.glfw.GLFW;
 
 public class SpruceFastClient implements ClientModInitializer {
@@ -26,7 +27,9 @@ public class SpruceFastClient implements ClientModInitializer {
                 "key.spruce_fast.start",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_BACKSPACE,
-                KeyBinding.Category.create("spruce_fast")
+                KeyBinding.Category.create(
+                    Identifier.of("spruce_fast", "main")
+                )
             )
         );
 
@@ -109,7 +112,6 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        // Move spruce logs into the crafting area.
         client.interactionManager.clickSlot(
             handler.syncId,
             logSlot,
@@ -118,7 +120,6 @@ public class SpruceFastClient implements ClientModInitializer {
             client.player
         );
 
-        // Take the resulting spruce planks.
         client.interactionManager.clickSlot(
             handler.syncId,
             0,
@@ -130,8 +131,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static int findLogSlot(MinecraftClient client) {
 
-        var inventory = client.player.getInventory();
-        var mainStacks = inventory.getMainStacks();
+        var mainStacks = client.player.getInventory().getMainStacks();
 
         for (int i = 0; i < mainStacks.size(); i++) {
 
@@ -141,7 +141,6 @@ public class SpruceFastClient implements ClientModInitializer {
                 continue;
             }
 
-            // Hotbar slots are 36-44 in the player handler.
             if (i >= 9) {
                 return i;
             }
