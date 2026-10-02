@@ -100,7 +100,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void run(MinecraftClient client) {
 
-        // No spruce logs = stop.
         if (countLogs(client) <= 0) {
 
             stopWalking(client);
@@ -116,8 +115,8 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * If a crafting table screen is already open,
-         * handle crafting.
+         * If the crafting table GUI is open,
+         * craft spruce planks.
          */
         if (client.player.currentScreenHandler
                 instanceof CraftingScreenHandler) {
@@ -130,7 +129,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Find a crafting table if we don't already have one.
+         * Find a crafting table.
          */
         if (craftingTable == null ||
             !client.world.getBlockState(craftingTable)
@@ -156,13 +155,18 @@ public class SpruceFastClient implements ClientModInitializer {
             }
         }
 
-        double distance = client.player.getPos()
-            .distanceTo(
-                Vec3d.ofCenter(craftingTable)
-            );
+        /*
+         * getEntityPos() is the 1.21.11
+         * player-position method.
+         */
+        double distance =
+            client.player.getEntityPos()
+                .distanceTo(
+                    Vec3d.ofCenter(craftingTable)
+                );
 
         /*
-         * Walk toward the crafting table.
+         * Walk toward crafting table.
          */
         if (distance > 3.0) {
 
@@ -172,7 +176,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Close enough — stop walking and open it.
+         * Close enough.
          */
         stopWalking(client);
 
@@ -182,19 +186,28 @@ public class SpruceFastClient implements ClientModInitializer {
     private static BlockPos findCraftingTable(
             MinecraftClient client) {
 
-        BlockPos playerPos = client.player.getBlockPos();
+        BlockPos playerPos =
+            client.player.getBlockPos();
 
         BlockPos closest = null;
 
-        double closestDistance = Double.MAX_VALUE;
+        double closestDistance =
+            Double.MAX_VALUE;
 
-        for (int x = -SEARCH_RADIUS; x <= SEARCH_RADIUS; x++) {
+        for (int x = -SEARCH_RADIUS;
+             x <= SEARCH_RADIUS;
+             x++) {
 
-            for (int y = -8; y <= 8; y++) {
+            for (int y = -8;
+                 y <= 8;
+                 y++) {
 
-                for (int z = -SEARCH_RADIUS; z <= SEARCH_RADIUS; z++) {
+                for (int z = -SEARCH_RADIUS;
+                     z <= SEARCH_RADIUS;
+                     z++) {
 
-                    BlockPos pos = playerPos.add(x, y, z);
+                    BlockPos pos =
+                        playerPos.add(x, y, z);
 
                     if (!client.world
                         .getBlockState(pos)
@@ -204,7 +217,7 @@ public class SpruceFastClient implements ClientModInitializer {
                     }
 
                     double distance =
-                        client.player.getPos()
+                        client.player.getEntityPos()
                             .squaredDistanceTo(
                                 Vec3d.ofCenter(pos)
                             );
@@ -232,10 +245,13 @@ public class SpruceFastClient implements ClientModInitializer {
             Vec3d.ofCenter(craftingTable);
 
         Vec3d player =
-            client.player.getPos();
+            client.player.getEntityPos();
 
-        double dx = target.x - player.x;
-        double dz = target.z - player.z;
+        double dx =
+            target.x - player.x;
+
+        double dz =
+            target.z - player.z;
 
         double horizontalDistance =
             Math.sqrt(dx * dx + dz * dz);
@@ -248,13 +264,11 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Turn the player toward the crafting table.
+         * Turn toward crafting table.
          */
         float yaw =
-            (float) (
-                Math.toDegrees(
-                    Math.atan2(-dx, dz)
-                )
+            (float) Math.toDegrees(
+                Math.atan2(-dx, dz)
             );
 
         client.player.setYaw(
@@ -318,7 +332,8 @@ public class SpruceFastClient implements ClientModInitializer {
             (CraftingScreenHandler)
                 client.player.currentScreenHandler;
 
-        int logSlot = findLogInventorySlot(client);
+        int logSlot =
+            findLogInventorySlot(client);
 
         if (logSlot == -1) {
 
@@ -337,15 +352,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Move one stack of spruce logs from the
-         * player's inventory into the crafting table.
-         *
-         * Crafting table handler:
-         *
-         * 0       = result
-         * 1-9     = crafting grid
-         * 10-36   = player inventory
-         * 37-45   = hotbar
+         * Move spruce logs into the crafting grid.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -356,9 +363,7 @@ public class SpruceFastClient implements ClientModInitializer {
         );
 
         /*
-         * Shift-click the crafting result.
-         *
-         * One spruce log -> four spruce planks.
+         * Take the resulting spruce planks.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -378,13 +383,6 @@ public class SpruceFastClient implements ClientModInitializer {
         var mainStacks =
             inventory.getMainStacks();
 
-        /*
-         * Main inventory slots:
-         * 0-35
-         *
-         * Screen-handler slots:
-         * 10-45
-         */
         for (int i = 0;
              i < mainStacks.size();
              i++) {
@@ -396,16 +394,19 @@ public class SpruceFastClient implements ClientModInitializer {
                 continue;
             }
 
+            /*
+             * Hotbar:
+             * 37-45
+             */
             if (i < 9) {
-
-                // Hotbar -> screen slot 37-45
                 return 37 + i;
-
-            } else {
-
-                // Main inventory -> screen slot 10-36
-                return 10 + (i - 9);
             }
+
+            /*
+             * Main inventory:
+             * 10-36
+             */
+            return 10 + (i - 9);
         }
 
         return -1;
@@ -421,7 +422,6 @@ public class SpruceFastClient implements ClientModInitializer {
                     .getMainStacks()) {
 
             if (stack.isOf(Items.SPRUCE_LOG)) {
-
                 amount += stack.getCount();
             }
         }
@@ -430,7 +430,6 @@ public class SpruceFastClient implements ClientModInitializer {
             client.player.getOffHandStack();
 
         if (offhand.isOf(Items.SPRUCE_LOG)) {
-
             amount += offhand.getCount();
         }
 
