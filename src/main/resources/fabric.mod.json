@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "spruce_fast",
+  "version": "${version}",
+  "name": "Spruce Fast",
+  "description": "Automatically converts spruce logs into spruce planks.",
+  "authors": [
+    "ZyroDevx"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.example.sprucefast.SpruceFastClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.17.0",
+    "minecraft": "~1.21.11",
+    "fabric-api": "*"
+  }
+}
