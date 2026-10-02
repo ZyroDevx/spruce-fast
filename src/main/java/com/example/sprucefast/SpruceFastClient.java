@@ -26,7 +26,7 @@ public class SpruceFastClient implements ClientModInitializer {
                 "key.spruce_fast.start",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_BACKSPACE,
-                "category.spruce_fast"
+                KeyBinding.Category.create("spruce_fast")
             )
         );
 
@@ -37,13 +37,17 @@ public class SpruceFastClient implements ClientModInitializer {
 
                 if (client.player != null) {
                     client.player.sendMessage(
-                        Text.literal("Spruce Fast: " + (enabled ? "ON" : "OFF")),
+                        Text.literal(
+                            "Spruce Fast: " + (enabled ? "ON" : "OFF")
+                        ),
                         true
                     );
                 }
             }
 
-            if (!enabled || client.player == null || client.interactionManager == null) {
+            if (!enabled
+                    || client.player == null
+                    || client.interactionManager == null) {
                 return;
             }
 
@@ -76,14 +80,16 @@ public class SpruceFastClient implements ClientModInitializer {
 
         int amount = 0;
 
-        for (ItemStack stack : client.player.getInventory().main) {
+        for (ItemStack stack : client.player.getInventory().getMainStacks()) {
             if (stack.isOf(Items.SPRUCE_LOG)) {
                 amount += stack.getCount();
             }
         }
 
-        if (client.player.getOffHandStack().isOf(Items.SPRUCE_LOG)) {
-            amount += client.player.getOffHandStack().getCount();
+        ItemStack offhand = client.player.getOffHandStack();
+
+        if (offhand.isOf(Items.SPRUCE_LOG)) {
+            amount += offhand.getCount();
         }
 
         return amount;
@@ -103,9 +109,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        /*
-         * Move a spruce log into the inventory crafting grid.
-         */
+        // Move spruce logs into the crafting area.
         client.interactionManager.clickSlot(
             handler.syncId,
             logSlot,
@@ -114,9 +118,7 @@ public class SpruceFastClient implements ClientModInitializer {
             client.player
         );
 
-        /*
-         * Take the resulting spruce planks.
-         */
+        // Take the resulting spruce planks.
         client.interactionManager.clickSlot(
             handler.syncId,
             0,
@@ -128,14 +130,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static int findLogSlot(MinecraftClient client) {
 
-        for (int i = 0; i < client.player.getInventory().main.size(); i++) {
+        var inventory = client.player.getInventory();
+        var mainStacks = inventory.getMainStacks();
 
-            ItemStack stack = client.player.getInventory().main.get(i);
+        for (int i = 0; i < mainStacks.size(); i++) {
+
+            ItemStack stack = mainStacks.get(i);
 
             if (!stack.isOf(Items.SPRUCE_LOG)) {
                 continue;
             }
 
+            // Hotbar slots are 36-44 in the player handler.
             if (i >= 9) {
                 return i;
             }
