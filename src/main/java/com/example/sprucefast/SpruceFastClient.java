@@ -101,9 +101,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void run(MinecraftClient client) {
 
-        /*
-         * Stop when there are no logs.
-         */
+        // Stop if there are no spruce logs.
         if (countLogs(client) <= 0) {
 
             stopWalking(client);
@@ -123,25 +121,21 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        /*
-         * If crafting table GUI is open,
-         * perform the actual crafting.
-         */
+        // If crafting table is open, craft.
         if (client.player.currentScreenHandler
                 instanceof CraftingScreenHandler) {
 
             stopWalking(client);
 
-            craftOneLog(client);
+            craftStack(client);
 
             return;
         }
 
-        /*
-         * Find crafting table.
-         */
+        // Find crafting table.
         if (craftingTable == null ||
-            !client.world.getBlockState(craftingTable)
+            !client.world
+                .getBlockState(craftingTable)
                 .isOf(Blocks.CRAFTING_TABLE)) {
 
             craftingTable = findCraftingTable(client);
@@ -164,18 +158,15 @@ public class SpruceFastClient implements ClientModInitializer {
             }
         }
 
-        /*
-         * Check distance.
-         */
+        // Distance to crafting table.
         double distance =
-            client.player.getEntityPos()
+            client.player
+                .getEntityPos()
                 .distanceTo(
                     Vec3d.ofCenter(craftingTable)
                 );
 
-        /*
-         * Walk toward table.
-         */
+        // Walk toward it.
         if (distance > 3.0) {
 
             walkToCraftingTable(client);
@@ -183,17 +174,12 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        /*
-         * Close enough.
-         */
+        // Close enough.
         stopWalking(client);
 
         openCraftingTable(client);
     }
 
-    /*
-     * Find the closest crafting table.
-     */
     private static BlockPos findCraftingTable(
             MinecraftClient client) {
 
@@ -227,7 +213,8 @@ public class SpruceFastClient implements ClientModInitializer {
                     }
 
                     double distance =
-                        client.player.getEntityPos()
+                        client.player
+                            .getEntityPos()
                             .squaredDistanceTo(
                                 Vec3d.ofCenter(pos)
                             );
@@ -244,9 +231,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return closest;
     }
 
-    /*
-     * Walk directly toward the crafting table.
-     */
     private static void walkToCraftingTable(
             MinecraftClient client) {
 
@@ -276,9 +260,6 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        /*
-         * Calculate yaw toward table.
-         */
         float yaw =
             (float) Math.toDegrees(
                 Math.atan2(-dx, dz)
@@ -292,15 +273,9 @@ public class SpruceFastClient implements ClientModInitializer {
             )
         );
 
-        /*
-         * Hold W.
-         */
         client.options.forwardKey.setPressed(true);
     }
 
-    /*
-     * Release movement keys.
-     */
     private static void stopWalking(
             MinecraftClient client) {
 
@@ -310,9 +285,6 @@ public class SpruceFastClient implements ClientModInitializer {
         client.options.rightKey.setPressed(false);
     }
 
-    /*
-     * Open the crafting table.
-     */
     private static void openCraftingTable(
             MinecraftClient client) {
 
@@ -336,16 +308,10 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /*
-     * Craft EXACTLY ONE spruce log.
-     *
-     * Crafting table slots:
-     *
-     * 0     = result
-     * 1-9   = 3x3 crafting grid
-     * 10-36 = inventory
-     * 37-45 = hotbar
+     * Put an ENTIRE spruce-log stack into one
+     * crafting slot, then take the planks.
      */
-    private static void craftOneLog(
+    private static void craftStack(
             MinecraftClient client) {
 
         if (!(client.player.currentScreenHandler
@@ -357,12 +323,8 @@ public class SpruceFastClient implements ClientModInitializer {
             (CraftingScreenHandler)
                 client.player.currentScreenHandler;
 
-        /*
-         * Make sure the cursor isn't already holding
-         * something before we start.
-         */
-        if (!client.player.currentScreenHandler
-                .getCursorStack().isEmpty()) {
+        // Don't start if the cursor is holding something.
+        if (!handler.getCursorStack().isEmpty()) {
             return;
         }
 
@@ -388,9 +350,7 @@ public class SpruceFastClient implements ClientModInitializer {
         /*
          * STEP 1
          *
-         * Left-click the inventory stack.
-         *
-         * This picks up the whole stack onto the cursor.
+         * Pick up the ENTIRE spruce-log stack.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -403,15 +363,14 @@ public class SpruceFastClient implements ClientModInitializer {
         /*
          * STEP 2
          *
-         * Right-click the crafting-grid slot.
+         * Left click the first crafting slot.
          *
-         * Right-click places EXACTLY ONE item
-         * from the cursor into the slot.
+         * This puts the ENTIRE stack there.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
             1,
-            1,
+            0,
             SlotActionType.PICKUP,
             client.player
         );
@@ -419,22 +378,10 @@ public class SpruceFastClient implements ClientModInitializer {
         /*
          * STEP 3
          *
-         * Put the remaining logs back into the
-         * original inventory slot.
-         */
-        client.interactionManager.clickSlot(
-            handler.syncId,
-            inventorySlot,
-            0,
-            SlotActionType.PICKUP,
-            client.player
-        );
-
-        /*
-         * STEP 4
+         * Take the crafting result.
          *
-         * Take the 4 spruce planks from the
-         * crafting result.
+         * One stack of 64 logs produces
+         * 256 spruce planks.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -445,14 +392,12 @@ public class SpruceFastClient implements ClientModInitializer {
         );
     }
 
-    /*
-     * Find a spruce-log inventory slot.
-     */
     private static int findLogInventorySlot(
             MinecraftClient client) {
 
         var mainStacks =
-            client.player.getInventory()
+            client.player
+                .getInventory()
                 .getMainStacks();
 
         for (int i = 0;
@@ -467,22 +412,18 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             /*
-             * Player hotbar:
-             * inventory index 0-8
-             *
-             * Crafting-screen slot:
-             * 37-45
+             * Hotbar inventory indexes 0-8
+             * correspond to crafting-screen
+             * slots 37-45.
              */
             if (i < 9) {
                 return 37 + i;
             }
 
             /*
-             * Main inventory:
-             * inventory index 9-35
-             *
-             * Crafting-screen slot:
-             * 10-36
+             * Main inventory indexes 9-35
+             * correspond to crafting-screen
+             * slots 10-36.
              */
             return 10 + (i - 9);
         }
@@ -490,16 +431,14 @@ public class SpruceFastClient implements ClientModInitializer {
         return -1;
     }
 
-    /*
-     * Count all spruce logs.
-     */
     private static int countLogs(
             MinecraftClient client) {
 
         int amount = 0;
 
         for (ItemStack stack :
-                client.player.getInventory()
+                client.player
+                    .getInventory()
                     .getMainStacks()) {
 
             if (stack.isOf(Items.SPRUCE_LOG)) {
