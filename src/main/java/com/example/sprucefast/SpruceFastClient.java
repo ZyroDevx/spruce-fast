@@ -43,6 +43,7 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -64,6 +65,10 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int PRICE_PER_LOG = 53;
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
+    // Crafting pacing (ticks). Raise these if the server/anti-cheat closes the table.
+    private static final int OPEN_WAIT = 10;  // wait after the table opens before the first click
+    private static final int CLICK_GAP = 2;   // gap between two queued clicks
+    private static final int SETTLE    = 5;   // wait after a batch before checking the result
     private static final boolean LOOP      = true;  // repeat the whole cycle
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
@@ -113,6 +118,11 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int tableRetries = 0;
     private static int noProgress = 0;
     private static int gridReturns = 0;
+    private static int tableSeenSync = -1;
+    private static int tableReadyAt = 0;
+    private static int tableCloses = 0;
+    private static int foreignCount = 0;
+    private static final ArrayDeque<Runnable> clickQueue = new ArrayDeque<>();
     private static int lastGridPlanks = -1;
     private static int pickupLastCount = -1;
     private static int pickupStable = 0;
@@ -208,6 +218,8 @@ public class SpruceFastClient implements ClientModInitializer {
         stuckCounter = 0;
         sellAttempts = 0;
         tableRetries = 0;
+        tableCloses = 0;
+        foreignCount = 0;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -227,6 +239,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void setPhase(Phase p) {
         phase = p;
+        clickQueue.clear();
         phaseTicks = 0;
         guiClicks = 0;
         lastClickKey = "";
@@ -559,6 +572,7 @@ public class SpruceFastClient implements ClientModInitializer {
         noProgress = 0;
         gridReturns = 0;
         lastGridPlanks = -1;
+        tableSeenSync = -1;
         setPhase(Phase.TABLE);
     }
 
@@ -566,16 +580,35 @@ public class SpruceFastClient implements ClientModInitializer {
      * Everything happens inside the REAL crafting table (server-side container):
      *   logs   -> planks  (1 log stack in the grid, shift-click the result)
      *   planks -> slabs   (3 plank stacks in the bottom row, shift-click the result)
-     * Stacks are moved with hotbar SWAP clicks, so the mouse cursor is never used.
+     *
+     * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
+     * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
+     * anti-cheat see human-like inventory activity.
      */
     private static void table(MinecraftClient c) {
 
-        if (phaseTicks > 6000) {
+        if (phaseTicks > 12000) {
             stop(c, "Crafting timed out.");
             return;
         }
 
         if (!(c.player.currentScreenHandler instanceof CraftingScreenHandler h)) {
+
+            if (tableSeenSync != -1) {
+                // It was open and now it isn't: something closed it (items in the grid go back to the hotbar).
+                tableSeenSync = -1;
+                clickQueue.clear();
+                LOG.warn("Crafting table was CLOSED by the server (or another source). Reopening.");
+                if (++tableCloses > 3) {
+                    stop(c, "The crafting table keeps closing (server/anti-cheat?). Raise OPEN_WAIT / CLICK_GAP / SETTLE.");
+                    return;
+                }
+                info(c, "Crafting table closed - reopening...");
+                setPhase(Phase.TABLE_OPEN);
+                cooldown = 20;
+                return;
+            }
+
             if (phaseTicks > 30) {
                 if (++tableRetries > 3) {
                     stop(c, "Could not open the crafting table.");
@@ -588,12 +621,31 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tableRetries = 0;
 
+        // Fresh table screen -> give the server time before touching anything.
+        if (tableSeenSync != h.syncId) {
+            tableSeenSync = h.syncId;
+            tableReadyAt = tickCounter + OPEN_WAIT;
+            clickQueue.clear();
+            dumpTable(h, "table opened");
+        }
+
+        if (tickCounter < tableReadyAt) {
+            return;
+        }
+
+        // Queued clicks go out one at a time.
+        if (!clickQueue.isEmpty()) {
+            clickQueue.poll().run();
+            cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
+            return;
+        }
+
         // We never use the cursor, but if something is stuck on it, put it away or drop it.
         if (!h.getCursorStack().isEmpty()) {
             if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
                 c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
             }
-            cooldown = 1;
+            cooldown = SETTLE;
             return;
         }
 
@@ -605,11 +657,9 @@ public class SpruceFastClient implements ClientModInitializer {
 
             for (int i = T_INV_FROM; i < T_INV_TO; i++) {
                 if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
-                    clickBtn(c, h, i, 1, SlotActionType.THROW);
+                    q(c, h, i, 1, SlotActionType.THROW);
                 }
             }
-
-            cooldown = 2;
             return;
         }
 
@@ -620,15 +670,31 @@ public class SpruceFastClient implements ClientModInitializer {
         boolean gridHas = false;
 
         for (int i = 1; i <= 9; i++) {
+
             ItemStack st = h.getSlot(i).getStack();
+
             if (st.isEmpty()) {
                 continue;
             }
-            gridHas = true;
+
             if (!st.isOf(Items.SPRUCE_PLANKS) && !st.isOf(Items.SPRUCE_LOG)) {
-                stop(c, "Remove other items from the crafting grid.");
+
+                // A foreign item: report it, send it back to the inventory and carry on.
+                String name = st.getName().getString() + " x" + st.getCount() + " (grid slot " + i + ")";
+                LOG.warn("Foreign item in crafting grid: {}", name);
+                dumpTable(h, "foreign item");
+
+                if (++foreignCount > 5) {
+                    stop(c, "Unexpected item in the crafting grid: " + name);
+                    return;
+                }
+
+                info(c, "Moving unexpected item out of the grid: " + name);
+                q(c, h, i, 0, SlotActionType.QUICK_MOVE);
                 return;
             }
+
+            gridHas = true;
             gridCount += st.getCount();
         }
 
@@ -640,7 +706,9 @@ public class SpruceFastClient implements ClientModInitializer {
                 lastGridPlanks = gridCount;      // progress
                 noProgress = 0;
                 gridReturns = 0;
-            } else if (++noProgress >= 6) {
+            } else if (++noProgress >= 4) {
+
+                dumpTable(h, "no crafting progress");
 
                 if (++gridReturns > 3) {
                     stop(c, "Crafting makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.");
@@ -650,18 +718,17 @@ public class SpruceFastClient implements ClientModInitializer {
                 // give the grid contents back to the inventory and try again
                 for (int i = 1; i <= 9; i++) {
                     if (!h.getSlot(i).getStack().isEmpty()) {
-                        click(c, h, i, SlotActionType.QUICK_MOVE);
+                        q(c, h, i, 0, SlotActionType.QUICK_MOVE);
                     }
                 }
 
                 noProgress = 0;
                 lastGridPlanks = -1;
-                cooldown = 3;
                 return;
             }
 
             click(c, h, 0, SlotActionType.QUICK_MOVE);
-            cooldown = 2;
+            cooldown = SETTLE;
             return;
         }
 
@@ -677,11 +744,8 @@ public class SpruceFastClient implements ClientModInitializer {
          */
 
         // logs first: ONE stack in the top-left cell
-        int logSlot = findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO);
-
-        if (logSlot != -1) {
-            loadToCell(c, h, logSlot, 1);
-            cooldown = 3;
+        if (findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO) != -1) {
+            queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});
             return;
         }
 
@@ -693,39 +757,79 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        int[] cells = {7, 8, 9};
+        queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});
+    }
 
-        for (int k = 0; k < 3; k++) {
-            int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
-            if (ps == -1) {
-                break;
+    /** Queues one click; it is sent later, one per CLICK_GAP ticks. */
+    private static void q(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
+        clickQueue.add(() -> {
+            if (c.player != null && c.player.currentScreenHandler == h) {
+                c.interactionManager.clickSlot(h.syncId, slot, button, type, c.player);
+            } else {
+                clickQueue.clear();
             }
-            loadToCell(c, h, ps, cells[k]);
-        }
-
-        cooldown = 3; // let the server compute the recipe result
+        });
     }
 
     /*
-     * Moves a whole stack into a crafting cell WITHOUT the cursor:
-     * bring it to the hotbar (swap), then swap the hotbar slot with the cell.
+     * Queues "move one whole stack of `item` into each of the given cells" without the cursor:
+     * stacks already in the hotbar are swapped straight into the cell; others are first swapped
+     * into a free hotbar slot (an EMPTY one if possible, so nothing foreign can end up in the grid).
      */
-    private static void loadToCell(MinecraftClient c, ScreenHandler h, int src, int cell) {
+    private static void queueLoad(MinecraftClient c, ScreenHandler h, Item item, int[] cells) {
 
-        int hb;
+        List<Integer> srcs = new ArrayList<>();
 
-        if (src >= 37) {
-            hb = src - 37;                 // already in the hotbar
-        } else {
-            hb = 8;
-            clickBtn(c, h, src, hb, SlotActionType.SWAP);
+        for (int i = 37; i < 46 && srcs.size() < cells.length; i++) {
+            if (h.getSlot(i).getStack().isOf(item)) srcs.add(i);
+        }
+        for (int i = 10; i < 37 && srcs.size() < cells.length; i++) {
+            if (h.getSlot(i).getStack().isOf(item)) srcs.add(i);
         }
 
-        clickBtn(c, h, cell, hb, SlotActionType.SWAP);
+        boolean[] hbUsed = new boolean[9];
+        for (int src : srcs) {
+            if (src >= 37) hbUsed[src - 37] = true;
+        }
+
+        for (int k = 0; k < srcs.size(); k++) {
+
+            int src = srcs.get(k);
+            int hb;
+
+            if (src >= 37) {
+                hb = src - 37;
+            } else {
+                hb = freeHotbar(h, hbUsed);
+                hbUsed[hb] = true;
+                q(c, h, src, hb, SlotActionType.SWAP);   // bring the stack into the hotbar
+            }
+
+            q(c, h, cells[k], hb, SlotActionType.SWAP);  // hotbar -> crafting cell
+        }
     }
 
-    private static void clickBtn(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
-        c.interactionManager.clickSlot(h.syncId, slot, button, type, c.player);
+    private static int freeHotbar(ScreenHandler h, boolean[] used) {
+        for (int hb = 0; hb < 9; hb++) {
+            if (!used[hb] && h.getSlot(37 + hb).getStack().isEmpty()) return hb;
+        }
+        for (int hb = 0; hb < 9; hb++) {
+            if (!used[hb]) return hb;
+        }
+        return 8;
+    }
+
+    private static void dumpTable(ScreenHandler h, String why) {
+        if (!DEBUG) {
+            return;
+        }
+        LOG.info("[TABLE] {} (syncId {})", why, h.syncId);
+        for (int i = 0; i < h.slots.size(); i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (!st.isEmpty()) {
+                LOG.info("  slot {} -> {} x{}", i, st.getItem(), st.getCount());
+            }
+        }
     }
 
     private static BlockPos findCraftingTable(MinecraftClient c) {
