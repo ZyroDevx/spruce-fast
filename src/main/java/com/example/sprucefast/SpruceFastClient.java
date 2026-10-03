@@ -47,8 +47,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Cycle: /orders (buy 576 spruce logs @ 52 each) -> wait -> collect
- *        -> craft planks -> /sell planks -> repeat.
+ * Cycle: /orders (buy 576 spruce logs @ 53 each) -> wait -> collect
+ *        -> craft planks -> craft slabs -> /sell -> repeat.
  *
  * BACKSPACE = start / stop.
  */
@@ -116,6 +116,12 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int lastGridPlanks = -1;
     private static int pickupLastCount = -1;
     private static int pickupStable = 0;
+
+    private static int resultWait = 0;
+    private static int craftFails = 0;
+    private static int placeTries = 0;
+    private static int loadAttempts = 0;
+    private static final int[] CELLS = {7, 8, 9};
 
     private static Object lastScreen = null;
     private static String lastClickKey = "";
@@ -524,7 +530,7 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /* ======================================================== */
-    /*                         CRAFTING                         */
+    /*                  CRAFTING (logs -> planks)               */
     /* ======================================================== */
 
     private static void craftOpen(MinecraftClient c) {
@@ -539,7 +545,11 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         c.setScreen(new InventoryScreen(c.player));
-        stuckCounter = 0;
+        resultWait = 0;
+        craftFails = 0;
+        placeTries = 0;
+        noProgress = 0;
+        lastGridPlanks = -1;
         setPhase(Phase.CRAFT);
         cooldown = 3;
     }
@@ -554,16 +564,24 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         PlayerScreenHandler h = c.player.playerScreenHandler;
+        ItemStack cursor = h.getCursorStack();
 
-        if (!h.getCursorStack().isEmpty()) {
-            if (!clearCursor(c, h)) {
-                stop(c, "Cursor holds an item and there is no free slot.");
+        // 1) Something on the cursor: logs -> grid, anything else -> back into the inventory.
+        if (!cursor.isEmpty()) {
+            if (cursor.isOf(Items.SPRUCE_LOG) && h.getSlot(1).getStack().isEmpty()) {
+                if (++placeTries > 10) {
+                    stop(c, "Server keeps rejecting the log placement. See logs/latest.log.");
+                    return;
+                }
+                click(c, h, 1, SlotActionType.PICKUP);
+            } else {
+                stashCursor(c, h, 9, 45);
             }
             cooldown = 3;
             return;
         }
 
-        // Logs in the grid -> shift-click the result once.
+        // 2) Logs in the grid -> wait for the server's result, then shift-click it.
         if (gridHasItems(h)) {
 
             if (!gridOnlyLogs(h)) {
@@ -571,9 +589,49 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
-            if (++stuckCounter > 8) {
-                stop(c, "No room for planks.");
+            if (h.getSlot(0).getStack().isEmpty()) {
+                if (++resultWait > 20) {
+                    resultWait = 0;
+                    if (++craftFails > 4) {
+                        stop(c, "Crafting result never appears (server blocks the 2x2 grid?).");
+                        return;
+                    }
+                    for (int i = 1; i <= 4; i++) {
+                        if (!h.getSlot(i).getStack().isEmpty()) {
+                            click(c, h, i, SlotActionType.QUICK_MOVE);
+                        }
+                    }
+                    cooldown = 3;
+                }
                 return;
+            }
+
+            resultWait = 0;
+
+            int gridLogs = 0;
+            for (int i = 1; i <= 4; i++) {
+                gridLogs += h.getSlot(i).getStack().getCount();
+            }
+
+            if (gridLogs == lastGridPlanks) {
+                if (++noProgress >= 3) {
+                    // no room for more planks -> turn planks into slabs, then come back for the rest
+                    noProgress = 0;
+                    lastGridPlanks = -1;
+                    if (count(c, Items.SPRUCE_PLANKS) >= 3) {
+                        c.player.closeHandledScreen();
+                        setPhase(Phase.TABLE_OPEN);
+                        cooldown = 6;
+                    } else {
+                        stop(c, "No room for planks.");
+                    }
+                    return;
+                }
+            } else {
+                noProgress = 0;
+                lastGridPlanks = gridLogs;
+                placeTries = 0;
+                craftFails = 0;
             }
 
             click(c, h, 0, SlotActionType.QUICK_MOVE);
@@ -581,7 +639,9 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        stuckCounter = 0;
+        // 3) Grid empty -> pick up the next log stack (placed on the next tick).
+        lastGridPlanks = -1;
+        noProgress = 0;
 
         int ls = findSlotWith(h, Items.SPRUCE_LOG);
 
@@ -593,13 +653,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         click(c, h, ls, SlotActionType.PICKUP);
-        click(c, h, 1, SlotActionType.PICKUP);
-
-        if (!h.getCursorStack().isEmpty()) {
-            click(c, h, ls, SlotActionType.PICKUP);
-        }
-
-        cooldown = 4;
+        cooldown = 3;
     }
 
     /* ======================================================== */
@@ -635,6 +689,9 @@ public class SpruceFastClient implements ClientModInitializer {
 
         noProgress = 0;
         lastGridPlanks = -1;
+        resultWait = 0;
+        craftFails = 0;
+        loadAttempts = 0;
         setPhase(Phase.TABLE);
     }
 
@@ -658,68 +715,95 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tableRetries = 0;
 
-        // Anything stuck on the cursor goes back into the inventory first.
-        if (!h.getCursorStack().isEmpty()) {
-            if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
-                stop(c, "Cursor holds an item and there is no free slot.");
+        // 0) Cursor: planks go into an empty bottom-row cell, anything else back to the inventory.
+        ItemStack cursor = h.getCursorStack();
+        if (!cursor.isEmpty()) {
+            int cell = cursor.isOf(Items.SPRUCE_PLANKS) ? firstEmptyCell(h) : -1;
+            if (cell != -1) {
+                click(c, h, cell, SlotActionType.PICKUP);
+            } else {
+                stashCursor(c, h, T_INV_FROM, T_INV_TO);
             }
-            cooldown = 1;
-            return;
-        }
-
-        /*
-         * A) Inventory is full -> Ctrl+Q (drop the WHOLE stack) on every slab stack.
-         */
-        if (countFree(h, T_INV_FROM, T_INV_TO) == 0
-                && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
-
-            for (int i = T_INV_FROM; i < T_INV_TO; i++) {
-                if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
-                    c.interactionManager.clickSlot(h.syncId, i, 1, SlotActionType.THROW, c.player);
-                }
-            }
-
             cooldown = 2;
             return;
         }
 
-        /*
-         * B) Planks in the grid -> shift-click the result (crafts everything in the grid).
-         */
+        // 1) Running out of room -> drop slab stacks (Ctrl+Q), a few per tick.
+        if (countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0
+                && countFree(h, T_INV_FROM, T_INV_TO) < 4) {
+            throwSlabs(c, h);
+            cooldown = 2;
+            return;
+        }
+
+        // 2) Inspect the grid.
         int gridPlanks = 0;
-        boolean gridHas = false;
+        int filled = 0;
+        boolean stray = false;
 
         for (int i = 1; i <= 9; i++) {
             ItemStack st = h.getSlot(i).getStack();
             if (st.isEmpty()) {
                 continue;
             }
-            gridHas = true;
             if (!st.isOf(Items.SPRUCE_PLANKS)) {
                 stop(c, "Remove other items from the crafting grid.");
                 return;
             }
             gridPlanks += st.getCount();
+            if (i >= 7) {
+                filled++;
+            } else {
+                stray = true;
+            }
         }
 
-        if (gridHas) {
+        if (stray) {
+            for (int i = 1; i <= 6; i++) {
+                if (!h.getSlot(i).getStack().isEmpty()) {
+                    click(c, h, i, SlotActionType.QUICK_MOVE);
+                }
+            }
+            cooldown = 2;
+            return;
+        }
+
+        // 3) Bottom row full -> craft.
+        if (filled == 3) {
+
+            if (h.getSlot(0).getStack().isEmpty()) {
+                if (++resultWait > 15) {
+                    resultWait = 0;
+                    if (++craftFails > 5) {
+                        stop(c, "Slab result never appears.");
+                        return;
+                    }
+                    for (int cell : CELLS) {
+                        click(c, h, cell, SlotActionType.QUICK_MOVE);
+                    }
+                    cooldown = 2;
+                }
+                return;
+            }
+
+            resultWait = 0;
 
             if (gridPlanks == lastGridPlanks) {
                 if (++noProgress >= 6) {
-                    // Leftover planks that can't form a recipe -> back to the inventory.
-                    for (int i = 1; i <= 9; i++) {
-                        if (!h.getSlot(i).getStack().isEmpty()) {
-                            click(c, h, i, SlotActionType.QUICK_MOVE);
-                        }
-                    }
                     noProgress = 0;
-                    lastGridPlanks = -1;
-                    cooldown = 2;
+                    if (countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
+                        throwSlabs(c, h);
+                        cooldown = 2;
+                    } else {
+                        stop(c, "Inventory full - no room for slabs.");
+                    }
                     return;
                 }
             } else {
                 noProgress = 0;
                 lastGridPlanks = gridPlanks;
+                loadAttempts = 0;
+                craftFails = 0;
             }
 
             click(c, h, 0, SlotActionType.QUICK_MOVE);
@@ -727,58 +811,69 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        // 4) Load planks into the bottom row (or finish).
         lastGridPlanks = -1;
         noProgress = 0;
 
-        /*
-         * C) Grid empty -> load the next planks, or finish.
-         */
+        int invPlanks = countOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
         int stacks = stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
-        int biggest = biggestStack(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
 
-        if (biggest < 3 && stacks < 3) {
-            c.player.closeHandledScreen();
-            info(c, "Slabs crafted. Picking up and selling...");
-            enterPickupWait();
+        if (filled == 0 && invPlanks < 3) {
+            finishTable(c);
             return;
         }
 
-        int[] cells = {7, 8, 9};
+        if (++loadAttempts > 40) {
+            stop(c, "Loading planks keeps failing. See logs/latest.log.");
+            return;
+        }
 
-        if (stacks >= 3) {
-
-            // three full stacks side by side (bottom row) -> up to 384 slabs per shift-click
-            for (int k = 0; k < 3; k++) {
-                int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
-                if (ps == -1) {
-                    break;
-                }
-                click(c, h, ps, SlotActionType.PICKUP);
-                click(c, h, cells[k], SlotActionType.PICKUP);
-                if (!h.getCursorStack().isEmpty()) {
-                    click(c, h, ps, SlotActionType.PICKUP);
-                }
+        if (filled == 0 && stacks < 3) {
+            // fewer than 3 stacks: pick one up and drag-split it over the 3 cells
+            int ps = biggestSlot(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+            if (ps == -1 || h.getSlot(ps).getStack().getCount() < 3) {
+                finishTable(c);
+                return;
             }
 
-        } else {
-
-            // fewer than 3 stacks: pick one up and drag-split it across the 3 cells
-            int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
             click(c, h, ps, SlotActionType.PICKUP);
 
             c.interactionManager.clickSlot(h.syncId, -999,
                 ScreenHandler.packQuickCraftData(0, 0), SlotActionType.QUICK_CRAFT, c.player);
-
-            for (int cell : cells) {
+            for (int cell : CELLS) {
                 c.interactionManager.clickSlot(h.syncId, cell,
                     ScreenHandler.packQuickCraftData(1, 0), SlotActionType.QUICK_CRAFT, c.player);
             }
-
             c.interactionManager.clickSlot(h.syncId, -999,
                 ScreenHandler.packQuickCraftData(2, 0), SlotActionType.QUICK_CRAFT, c.player);
+
+            cooldown = 3; // the remainder left on the cursor is stashed by step 0
+            return;
         }
 
-        cooldown = 3; // the server has to compute the recipe result
+        if (filled > 0 && stacks < 3 - filled) {
+            // not enough stacks left to fill the row -> take the planks back and re-split
+            for (int cell : CELLS) {
+                if (!h.getSlot(cell).getStack().isEmpty()) {
+                    click(c, h, cell, SlotActionType.QUICK_MOVE);
+                }
+            }
+            cooldown = 2;
+            return;
+        }
+
+        // stack mode: pick up one stack; step 0 drops it into the next empty cell
+        int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+        if (ps != -1) {
+            click(c, h, ps, SlotActionType.PICKUP);
+        }
+        cooldown = 2;
+    }
+
+    private static void finishTable(MinecraftClient c) {
+        c.player.closeHandledScreen();
+        info(c, "Slabs crafted. Picking up and selling...");
+        enterPickupWait();
     }
 
     private static BlockPos findCraftingTable(MinecraftClient c) {
@@ -1041,18 +1136,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return any;
     }
 
-    /** Shift-clicks up to 6 matching slots in [from, to). Returns true if anything was clicked. */
-    private static boolean quickMoveAll(MinecraftClient c, ScreenHandler h, int from, int to, Item item) {
-        int done = 0;
-        for (int i = from; i < to && done < 6; i++) {
-            if (h.getSlot(i).getStack().isOf(item)) {
-                click(c, h, i, SlotActionType.QUICK_MOVE);
-                done++;
-            }
-        }
-        return done > 0;
-    }
-
     /** Logs a GUI once so we can see exact titles and button names. */
     private static void dump(HandledScreen<?> hs) {
         if (hs == lastScreen) {
@@ -1130,21 +1213,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return null;
     }
 
-    /** Types the text and presses the button in the same tick. */
-    private static boolean typeAndPress(MinecraftClient c, List<ClickableWidget> ws, String text, String label) {
-
-        TextFieldWidget tf = firstTextField(ws);
-        ClickableWidget b = button(ws, label);
-
-        if (tf == null || b == null) {
-            return false;
-        }
-
-        tf.setText(text);
-        pressButton(b);
-        return true;
-    }
-
     /*
      * Simulates a left click in the middle of the widget.
      * This is the only version-sensitive call (written for Minecraft 1.21.9+).
@@ -1193,15 +1261,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return n;
     }
 
-    private static int biggestStack(ScreenHandler h, Item item, int from, int to) {
-        int best = 0;
-        for (int i = from; i < to; i++) {
-            ItemStack st = h.getSlot(i).getStack();
-            if (st.isOf(item) && st.getCount() > best) best = st.getCount();
-        }
-        return best;
-    }
-
     private static int findIn(ScreenHandler h, Item item, int from, int to) {
         for (int i = from; i < to; i++) {
             if (h.getSlot(i).getStack().isOf(item)) return i;
@@ -1209,14 +1268,52 @@ public class SpruceFastClient implements ClientModInitializer {
         return -1;
     }
 
-    private static boolean putCursorAway(MinecraftClient c, ScreenHandler h, int from, int to) {
+    private static int firstEmptyCell(ScreenHandler h) {
+        for (int cell : CELLS) {
+            if (h.getSlot(cell).getStack().isEmpty()) return cell;
+        }
+        return -1;
+    }
+
+    private static int biggestSlot(ScreenHandler h, Item item, int from, int to) {
+        int best = -1, bc = 0;
+        for (int i = from; i < to; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isOf(item) && st.getCount() > bc) {
+                bc = st.getCount();
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static void throwSlabs(MinecraftClient c, ScreenHandler h) {
+        int n = 0;
+        for (int i = T_INV_FROM; i < T_INV_TO && n < 8; i++) {
+            if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
+                c.interactionManager.clickSlot(h.syncId, i, 1, SlotActionType.THROW, c.player);
+                n++;
+            }
+        }
+    }
+
+    /** Never fails: merge into a matching stack, else an empty slot, else drop it outside the GUI. */
+    private static void stashCursor(MinecraftClient c, ScreenHandler h, int from, int to) {
+        ItemStack cur = h.getCursorStack();
+        for (int i = from; i < to; i++) {
+            ItemStack s = h.getSlot(i).getStack();
+            if (!s.isEmpty() && s.isOf(cur.getItem()) && s.getCount() < s.getMaxCount()) {
+                click(c, h, i, SlotActionType.PICKUP);
+                return;
+            }
+        }
         for (int i = from; i < to; i++) {
             if (h.getSlot(i).getStack().isEmpty()) {
                 click(c, h, i, SlotActionType.PICKUP);
-                return true;
+                return;
             }
         }
-        return false;
+        c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
     }
 
     /* ---------- player inventory (PlayerScreenHandler indexes) ---------- */
@@ -1264,15 +1361,5 @@ public class SpruceFastClient implements ClientModInitializer {
             if (!s.isEmpty() && !s.isOf(Items.SPRUCE_LOG)) return false;
         }
         return true;
-    }
-
-    private static boolean clearCursor(MinecraftClient c, PlayerScreenHandler h) {
-        for (int s = 9; s <= 44; s++) {
-            if (h.getSlot(s).getStack().isEmpty()) {
-                click(c, h, s, SlotActionType.PICKUP);
-                return true;
-            }
-        }
-        return false;
     }
 }
