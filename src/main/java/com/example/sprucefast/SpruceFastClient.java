@@ -148,10 +148,26 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Don't do anything while holding an item
-         * with the mouse cursor.
+         * If the cursor is holding something (leftover from a
+         * previous click), put it into an empty slot instead of
+         * waiting forever.
          */
         if (!handler.getCursorStack().isEmpty()) {
+
+            if (!clearCursor(client, handler)) {
+
+                enabled = false;
+
+                client.player.sendMessage(
+                    Text.literal(
+                        "Spruce Fast: Cursor is holding an item and there is no free slot."
+                    ),
+                    true
+                );
+            }
+
+            cooldown = 3;
+
             return;
         }
 
@@ -275,6 +291,33 @@ public class SpruceFastClient implements ClientModInitializer {
          * Wait for the server to compute the crafting result.
          */
         cooldown = 3;
+    }
+
+    /*
+     * Puts whatever is on the cursor into an empty
+     * inventory/hotbar slot. Returns false if none is free.
+     */
+    private static boolean clearCursor(
+            MinecraftClient client,
+            PlayerScreenHandler handler) {
+
+        for (int s = 9; s <= 44; s++) {
+
+            if (handler.getSlot(s).getStack().isEmpty()) {
+
+                client.interactionManager.clickSlot(
+                    handler.syncId,
+                    s,
+                    0,
+                    SlotActionType.PICKUP,
+                    client.player
+                );
+
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /*
