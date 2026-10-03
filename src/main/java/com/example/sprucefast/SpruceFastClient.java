@@ -69,6 +69,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int OPEN_WAIT = 10;  // wait after the table opens before the first click
     private static final int CLICK_GAP = 2;   // gap between two queued clicks
     private static final int SETTLE    = 5;   // wait after a batch before checking the result
+    private static final int WALK_TICKS = 22;   // walk out (and back) this long to collect dropped slabs (~4.7 blocks)
     private static final boolean LOOP      = true;  // repeat the whole cycle
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
@@ -81,7 +82,7 @@ public class SpruceFastClient implements ClientModInitializer {
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
         TABLE_OPEN, TABLE,
-        SELL_CMD, SELL_GUI, PICKUP_WAIT
+        SELL_CMD, SELL_GUI, PICKUP_WALK, PICKUP_WAIT
     }
 
     private static KeyBinding startKey;
@@ -118,6 +119,8 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int tableRetries = 0;
     private static int noProgress = 0;
     private static int gridReturns = 0;
+    private static float dropYaw = 0f;
+    private static boolean droppedAny = false;
     private static int tableSeenSync = -1;
     private static int tableReadyAt = 0;
     private static int tableCloses = 0;
@@ -199,6 +202,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case COLLECT_GUI  -> collectGui(c);
             case TABLE_OPEN   -> tableOpen(c);
             case TABLE        -> table(c);
+            case PICKUP_WALK  -> pickupWalk(c);
             case PICKUP_WAIT  -> pickupWait(c);
             case SELL_CMD     -> sellCmd(c);
             case SELL_GUI     -> sellGui(c);
@@ -220,6 +224,7 @@ public class SpruceFastClient implements ClientModInitializer {
         tableRetries = 0;
         tableCloses = 0;
         foreignCount = 0;
+        droppedAny = false;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -228,6 +233,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void stop(MinecraftClient c, String reason) {
         phase = Phase.IDLE;
+        releaseKeys(c);
         pendingChat = null;
         if (c.player != null) {
             if (c.currentScreen instanceof HandledScreen<?>) {
@@ -563,8 +569,11 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        // Look straight down so Ctrl+Q drops land at our feet (and get picked up again later).
-        c.player.setPitch(90.0f);
+        // Face a free direction, level: Ctrl+Q drops then fly ~3 blocks away from us, so they are
+        // NOT picked up again while we keep crafting. We walk over to them at the end.
+        dropYaw = bestDropYaw(c);
+        c.player.setYaw(dropYaw);
+        c.player.setPitch(0.0f);
 
         BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
         c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
@@ -658,6 +667,7 @@ public class SpruceFastClient implements ClientModInitializer {
             for (int i = T_INV_FROM; i < T_INV_TO; i++) {
                 if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
                     q(c, h, i, 1, SlotActionType.THROW);
+                    droppedAny = true;
                 }
             }
             return;
@@ -870,7 +880,106 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void enterPickupWait() {
         pickupLastCount = -1;
         pickupStable = 0;
-        setPhase(Phase.PICKUP_WAIT);
+        setPhase(droppedAny ? Phase.PICKUP_WALK : Phase.PICKUP_WAIT);
+    }
+
+    /*
+     * Walk out over the dropped slabs and back again (the inventory picks them up on the way).
+     */
+    private static void pickupWalk(MinecraftClient c) {
+
+        if (c.currentScreen instanceof HandledScreen<?>) {
+            closeScreens(c);
+        }
+
+        if (phaseTicks == 1) {
+            c.player.setYaw(dropYaw);
+            c.player.setPitch(0.0f);
+        }
+
+        if (phaseTicks <= 4) {
+            return; // let the rotation reach the server first
+        }
+
+        int t = phaseTicks - 4;
+
+        if (t <= WALK_TICKS) {
+            c.options.backKey.setPressed(false);
+            c.options.forwardKey.setPressed(true);
+            return;
+        }
+
+        if (t <= 2 * WALK_TICKS) {
+            c.options.forwardKey.setPressed(false);
+            c.options.backKey.setPressed(true);
+            return;
+        }
+
+        releaseKeys(c);
+
+        if (t < 2 * WALK_TICKS + 10) {
+            return; // let the last items be picked up
+        }
+
+        if (count(c, Items.SPRUCE_SLAB) == 0) {
+            droppedAny = false; // nothing left on the ground
+            afterSell(c);
+        } else {
+            pickupLastCount = -1;
+            pickupStable = 0;
+            setPhase(Phase.PICKUP_WAIT);
+        }
+    }
+
+    private static void releaseKeys(MinecraftClient c) {
+        if (c.options != null) {
+            c.options.forwardKey.setPressed(false);
+            c.options.backKey.setPressed(false);
+        }
+    }
+
+    /** Picks the horizontal direction with the most free, floored blocks ahead (up to 5). */
+    private static float bestDropYaw(MinecraftClient c) {
+
+        BlockPos feet = c.player.getBlockPos();
+        float base = Math.round(c.player.getYaw() / 90.0f) * 90.0f;
+
+        float best = base;
+        int bestScore = -1;
+
+        for (int k = 0; k < 4; k++) {
+
+            float yaw = base + 90.0f * k;
+            double rad = Math.toRadians(yaw);
+            int dx = (int) Math.round(-Math.sin(rad));
+            int dz = (int) Math.round(Math.cos(rad));
+
+            int score = 0;
+
+            for (int step = 1; step <= 5; step++) {
+
+                BlockPos f = feet.add(dx * step, 0, dz * step);
+                BlockPos hd = f.up();
+                BlockPos fl = f.down();
+
+                boolean clear = c.world.getBlockState(f).getCollisionShape(c.world, f).isEmpty()
+                        && c.world.getBlockState(hd).getCollisionShape(c.world, hd).isEmpty();
+                boolean floor = !c.world.getBlockState(fl).getCollisionShape(c.world, fl).isEmpty();
+
+                if (!clear || !floor) {
+                    break;
+                }
+
+                score++;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = yaw;
+            }
+        }
+
+        return best;
     }
 
     /*
