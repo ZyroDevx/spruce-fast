@@ -35,9 +35,11 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
@@ -70,6 +72,8 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int CLICK_GAP = 2;   // gap between two queued clicks
     private static final int SETTLE    = 5;   // wait after a batch before checking the result
     private static final int WALK_TICKS = 22;   // walk out (and back) this long to collect dropped slabs (~4.7 blocks)
+    private static final double TABLE_REACH  = 3.6;  // walk closer than this before using the table
+    private static final int    TABLE_SEARCH = 10;   // look for the crafting table within this many blocks
     private static final boolean LOOP      = true;  // repeat the whole cycle
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
@@ -120,6 +124,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int noProgress = 0;
     private static int gridReturns = 0;
     private static float dropYaw = 0f;
+    private static int tableAimStage = 0;
     private static boolean droppedAny = false;
     private static int tableSeenSync = -1;
     private static int tableReadyAt = 0;
@@ -225,6 +230,7 @@ public class SpruceFastClient implements ClientModInitializer {
         tableCloses = 0;
         foreignCount = 0;
         droppedAny = false;
+        tableAimStage = 0;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -537,7 +543,9 @@ public class SpruceFastClient implements ClientModInitializer {
         closeScreens(c);
         info(c, "Collected " + collectedTotal + "/" + TARGET_LOGS + " logs.");
         tripLogs = 0;
+        tableAimStage = 0;
         setPhase(Phase.TABLE_OPEN);
+        cooldown = 6;
     }
 
     /* ======================================================== */
@@ -554,6 +562,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void tableOpen(MinecraftClient c) {
 
         if (count(c, Items.SPRUCE_LOG) == 0 && count(c, Items.SPRUCE_PLANKS) < 3) {
+            releaseKeys(c);
             if (count(c, Items.SPRUCE_SLAB) > 0) {
                 enterPickupWait();
             } else {
@@ -562,27 +571,76 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        BlockPos pos = findCraftingTable(c);
-
-        if (pos == null) {
-            stop(c, "No crafting table within reach. Place one next to you.");
+        if (phaseTicks > 400) {
+            releaseKeys(c);
+            stop(c, "Could not get to the crafting table.");
             return;
         }
 
-        // Face a free direction, level: Ctrl+Q drops then fly ~3 blocks away from us, so they are
-        // NOT picked up again while we keep crafting. We walk over to them at the end.
-        dropYaw = bestDropYaw(c);
-        c.player.setYaw(dropYaw);
-        c.player.setPitch(0.0f);
+        BlockPos pos = findCraftingTable(c);
 
-        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+        if (pos == null) {
+            releaseKeys(c);
+            stop(c, "No crafting table found within " + TABLE_SEARCH + " blocks. Place one next to you.");
+            return;
+        }
+
+        Vec3d center = Vec3d.ofCenter(pos);
+        double dist = c.player.getEyePos().distanceTo(center);
+
+        // Too far (e.g. after walking out to pick up slabs): walk back toward the table first.
+        if (dist > TABLE_REACH) {
+            aimAt(c, center);
+            c.options.backKey.setPressed(false);
+            c.options.forwardKey.setPressed(true);
+            c.options.jumpKey.setPressed(c.player.horizontalCollision);
+            tableAimStage = 0;
+            return;
+        }
+
+        releaseKeys(c);
+
+        // Stage 0: remember the best drop direction, then LOOK at the table (servers check where we look).
+        if (tableAimStage == 0) {
+            dropYaw = bestDropYaw(c);
+            aimAt(c, center);
+            tableAimStage = 1;
+            cooldown = 3;
+            return;
+        }
+
+        tableAimStage = 0;
+
+        // Stage 1: use the block exactly where the crosshair points.
+        Vec3d eye = c.player.getEyePos();
+        Vec3d end = eye.add(c.player.getRotationVec(1.0f).multiply(5.0));
+
+        BlockHitResult hit = c.world.raycast(new RaycastContext(
+            eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, c.player));
+
+        if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos)) {
+            hit = new BlockHitResult(center, Direction.UP, pos, false);
+        }
+
         c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
+        c.player.swingHand(Hand.MAIN_HAND);
 
         noProgress = 0;
         gridReturns = 0;
         lastGridPlanks = -1;
         tableSeenSync = -1;
         setPhase(Phase.TABLE);
+    }
+
+    /** Turns the player to look at a point (yaw/pitch like vanilla). */
+    private static void aimAt(MinecraftClient c, Vec3d target) {
+        Vec3d eye = c.player.getEyePos();
+        double dx = target.x - eye.x;
+        double dy = target.y - eye.y;
+        double dz = target.z - eye.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        c.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        c.player.setPitch((float) -Math.toDegrees(Math.atan2(dy, horiz)));
     }
 
     /*
@@ -634,6 +692,8 @@ public class SpruceFastClient implements ClientModInitializer {
         if (tableSeenSync != h.syncId) {
             tableSeenSync = h.syncId;
             tableReadyAt = tickCounter + OPEN_WAIT;
+            c.player.setYaw(dropYaw);
+            c.player.setPitch(0.0f);
             clickQueue.clear();
             dumpTable(h, "table opened");
         }
@@ -848,11 +908,11 @@ public class SpruceFastClient implements ClientModInitializer {
         Vec3d eye = c.player.getEyePos();
 
         BlockPos best = null;
-        double bestD = 4.4 * 4.4;
+        double bestD = Double.MAX_VALUE;
 
-        for (int dx = -4; dx <= 4; dx++) {
+        for (int dx = -TABLE_SEARCH; dx <= TABLE_SEARCH; dx++) {
             for (int dy = -4; dy <= 4; dy++) {
-                for (int dz = -4; dz <= 4; dz++) {
+                for (int dz = -TABLE_SEARCH; dz <= TABLE_SEARCH; dz++) {
 
                     BlockPos p = base.add(dx, dy, dz);
 
@@ -935,6 +995,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (c.options != null) {
             c.options.forwardKey.setPressed(false);
             c.options.backKey.setPressed(false);
+            c.options.jumpKey.setPressed(false);
         }
     }
 
