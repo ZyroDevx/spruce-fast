@@ -1,6 +1,7 @@
 package com.example.sprucefast;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
@@ -45,9 +46,12 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 
 /**
  * Cycle: /orders (buy 576 spruce logs @ 52 each) -> wait -> collect
@@ -67,10 +71,36 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int PRICE_PER_LOG = 53;
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
-    // Crafting pacing (ticks). Raise these if the server/anti-cheat closes the table.
-    private static final int OPEN_WAIT = 10;  // wait after the table opens before the first click
-    private static final int CLICK_GAP = 2;   // gap between two queued clicks
-    private static final int SETTLE    = 5;   // wait after a batch before checking the result
+    /* ---------------- SELF-LEARNING TIMING ----------------
+     * The mod starts with safe delays, then tries to shrink them a little every time things
+     * work, and slows down (remembering the value that failed) when something goes wrong:
+     * the table gets closed, a craft makes no progress, or a dialog click has to be repeated.
+     * What it learned is saved in  config/spruce_fast_tuning.properties  and reused next time.
+     * Delete that file to start learning from scratch.
+     */
+    private static final boolean LEARNING = true;
+
+    private static final int T_OPEN = 0, T_GAP = 1, T_SETTLE = 2, T_DIALOG = 3, T_RETRY = 4;
+    private static final String[] T_NAME  = {"openWait", "clickGap", "settle", "dialogSettle", "pressRetry"};
+    // meaning: ticks to wait after the table opens | ticks between clicks | ticks to wait before
+    //          checking a craft | ticks a fresh dialog must exist before we click | ticks before re-clicking
+    private static final int[] T_START = {10, 2, 5, 2, 15};
+    private static final int[] T_MIN   = { 5, 1, 3, 1,  8};   // hard floors: it never goes faster than this
+    private static final int[] T_MAX   = {30, 8, 12, 6, 40};
+
+    private static final int[] tune         = T_START.clone();
+    private static final int[] learnedFloor = T_MIN.clone();   // "this value failed before, don't go below"
+
+    private static final int G_TABLE = 0, G_DIALOG = 1;
+    private static final int[][] GROUP = {{T_OPEN, T_GAP, T_SETTLE}, {T_DIALOG, T_RETRY}};
+    private static final int[] GOOD_NEEDED = {4, 3};   // clean events before one speed-up step
+    private static final int[] goodStreak = new int[2];
+
+    private static int cycleStartTick = 0;
+    private static int cycleFailures = 0;
+    private static int cleanCycles = 0;
+    private static int bestCycleTicks = Integer.MAX_VALUE;
+
     private static final int WALK_TICKS = 22;   // walk out (and back) this long to collect dropped slabs (~4.7 blocks)
     private static final double TABLE_REACH  = 3.6;  // walk closer than this before using the table
     private static final int    TABLE_SEARCH = 10;   // look for the crafting table within this many blocks
@@ -140,6 +170,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+
+        loadTuning();
 
         startKey = KeyBindingHelper.registerKeyBinding(
             new KeyBinding(
@@ -231,6 +263,8 @@ public class SpruceFastClient implements ClientModInitializer {
         foreignCount = 0;
         droppedAny = false;
         tableAimStage = 0;
+        cycleStartTick = tickCounter;
+        cycleFailures = 0;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -375,18 +409,21 @@ public class SpruceFastClient implements ClientModInitializer {
 
         // New dialog screen -> remember when we first saw it.
         if (sc != dialogScreen) {
+            if (dialogScreen != null && lastPressTick > -500) {
+                good(G_DIALOG);      // our click on the previous screen worked
+            }
             dialogScreen = sc;
             dialogSince = tickCounter;
             lastPressTick = -1000;
         }
 
         // Let a fresh screen finish building before touching it.
-        if (tickCounter - dialogSince < 2) {
+        if (tickCounter - dialogSince < tune[T_DIALOG]) {
             return;
         }
 
         // Pressed recently on this same screen -> wait; retry only if nothing changed.
-        if (tickCounter - lastPressTick < 15) {
+        if (tickCounter - lastPressTick < tune[T_RETRY]) {
             return;
         }
 
@@ -396,6 +433,7 @@ public class SpruceFastClient implements ClientModInitializer {
         String title = sc.getTitle().getString().toLowerCase();
         TextFieldWidget tf = firstTextField(ws);
         ClickableWidget b;
+        boolean repeatedPress = lastPressTick > -500;   // same screen, we already pressed here
 
         /*
          * The action is chosen by what is ON the screen (not by a step counter),
@@ -431,6 +469,10 @@ public class SpruceFastClient implements ClientModInitializer {
 
         } else {
             return;
+        }
+
+        if (repeatedPress) {
+            fail(c, G_DIALOG, "a dialog click had to be repeated");
         }
 
         lastPressTick = tickCounter;
@@ -649,7 +691,7 @@ public class SpruceFastClient implements ClientModInitializer {
      *   planks -> slabs   (3 plank stacks in the bottom row, shift-click the result)
      *
      * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
-     * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
+     * ONE per clickGap ticks, after a short wait when the table opens, so the server and
      * anti-cheat see human-like inventory activity.
      */
     private static void table(MinecraftClient c) {
@@ -666,8 +708,9 @@ public class SpruceFastClient implements ClientModInitializer {
                 tableSeenSync = -1;
                 clickQueue.clear();
                 LOG.warn("Crafting table was CLOSED by the server (or another source). Reopening.");
+                fail(c, G_TABLE, "the crafting table was closed");
                 if (++tableCloses > 3) {
-                    stop(c, "The crafting table keeps closing (server/anti-cheat?). Raise OPEN_WAIT / CLICK_GAP / SETTLE.");
+                    stop(c, "The crafting table keeps closing (server/anti-cheat?). It slowed itself down; if this keeps happening, delete config/spruce_fast_tuning.properties.");
                     return;
                 }
                 info(c, "Crafting table closed - reopening...");
@@ -691,7 +734,7 @@ public class SpruceFastClient implements ClientModInitializer {
         // Fresh table screen -> give the server time before touching anything.
         if (tableSeenSync != h.syncId) {
             tableSeenSync = h.syncId;
-            tableReadyAt = tickCounter + OPEN_WAIT;
+            tableReadyAt = tickCounter + tune[T_OPEN];
             c.player.setYaw(dropYaw);
             c.player.setPitch(0.0f);
             clickQueue.clear();
@@ -705,7 +748,7 @@ public class SpruceFastClient implements ClientModInitializer {
         // Queued clicks go out one at a time.
         if (!clickQueue.isEmpty()) {
             clickQueue.poll().run();
-            cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
+            cooldown = clickQueue.isEmpty() ? tune[T_SETTLE] : tune[T_GAP];
             return;
         }
 
@@ -714,7 +757,7 @@ public class SpruceFastClient implements ClientModInitializer {
             if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
                 c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
             }
-            cooldown = SETTLE;
+            cooldown = tune[T_SETTLE];
             return;
         }
 
@@ -752,6 +795,7 @@ public class SpruceFastClient implements ClientModInitializer {
                 // A foreign item: report it, send it back to the inventory and carry on.
                 String name = st.getName().getString() + " x" + st.getCount() + " (grid slot " + i + ")";
                 LOG.warn("Foreign item in crafting grid: {}", name);
+                fail(c, G_TABLE, "unexpected item in the crafting grid");
                 dumpTable(h, "foreign item");
 
                 if (++foreignCount > 5) {
@@ -776,9 +820,11 @@ public class SpruceFastClient implements ClientModInitializer {
                 lastGridPlanks = gridCount;      // progress
                 noProgress = 0;
                 gridReturns = 0;
+                good(G_TABLE);
             } else if (++noProgress >= 4) {
 
                 dumpTable(h, "no crafting progress");
+                fail(c, G_TABLE, "crafting made no progress");
 
                 if (++gridReturns > 3) {
                     stop(c, "Crafting makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.");
@@ -798,12 +844,13 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             click(c, h, 0, SlotActionType.QUICK_MOVE);
-            cooldown = SETTLE;
+            cooldown = tune[T_SETTLE];
             return;
         }
 
         if (lastGridPlanks != -1) {
             gridReturns = 0; // grid went empty = it was crafted
+            good(G_TABLE);
         }
 
         lastGridPlanks = -1;
@@ -830,7 +877,7 @@ public class SpruceFastClient implements ClientModInitializer {
         queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});
     }
 
-    /** Queues one click; it is sent later, one per CLICK_GAP ticks. */
+    /** Queues one click; it is sent later, one per clickGap ticks. */
     private static void q(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
         clickQueue.add(() -> {
             if (c.player != null && c.player.currentScreenHandler == h) {
@@ -1148,6 +1195,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (collectedTotal >= TARGET_LOGS) {
 
+            endCycle(c);
+
             if (!LOOP) {
                 stop(c, "Done.");
                 return;
@@ -1166,6 +1215,152 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         setPhase(Phase.ORDER_WAIT);
+    }
+
+    /* ======================================================== */
+    /*                      SELF-LEARNING                       */
+    /* ======================================================== */
+
+    /** Something went wrong: slow this group down and remember the value that failed. */
+    private static void fail(MinecraftClient c, int group, String why) {
+
+        cycleFailures++;
+
+        if (!LEARNING) {
+            return;
+        }
+
+        goodStreak[group] = 0;
+
+        for (int p : GROUP[group]) {
+            int v = tune[p];
+            learnedFloor[p] = Math.min(T_MAX[p], Math.max(learnedFloor[p], v + 1));
+            tune[p] = Math.min(T_MAX[p], v + Math.max(1, v / 2));
+        }
+
+        LOG.info("[LEARN] {} -> slowing down: {}", why, tuneString());
+        saveTuning();
+    }
+
+    /** Something worked cleanly: after enough of these, shrink this group's delays by one tick. */
+    private static void good(int group) {
+
+        if (!LEARNING) {
+            return;
+        }
+
+        if (++goodStreak[group] < GOOD_NEEDED[group]) {
+            return;
+        }
+
+        goodStreak[group] = 0;
+
+        boolean changed = false;
+
+        for (int p : GROUP[group]) {
+            if (tune[p] > learnedFloor[p]) {
+                tune[p]--;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            LOG.info("[LEARN] speeding up: {}", tuneString());
+            saveTuning();
+        }
+    }
+
+    /** A whole order -> craft -> sell cycle is finished: report speed, re-allow probing of old limits. */
+    private static void endCycle(MinecraftClient c) {
+
+        int ticks = tickCounter - cycleStartTick;
+
+        if (cycleFailures == 0) {
+            cleanCycles++;
+            // every 3 clean cycles, forget one step of the "this failed before" memory so it can probe again
+            if (LEARNING && cleanCycles % 3 == 0) {
+                for (int p = 0; p < learnedFloor.length; p++) {
+                    learnedFloor[p] = Math.max(T_MIN[p], learnedFloor[p] - 1);
+                }
+            }
+        } else {
+            cleanCycles = 0;
+        }
+
+        boolean best = ticks < bestCycleTicks;
+        if (best) {
+            bestCycleTicks = ticks;
+        }
+
+        String msg = "Cycle took " + (ticks / 20) + "s" + (best ? " (new best!)" : " (best " + (bestCycleTicks / 20) + "s)")
+            + ", problems: " + cycleFailures + ", timing: " + tuneString();
+
+        LOG.info("[LEARN] {}", msg);
+
+        if (c.player != null) {
+            c.player.sendMessage(Text.literal("Spruce Fast: " + msg), false);
+        }
+
+        cycleStartTick = tickCounter;
+        cycleFailures = 0;
+        saveTuning();
+    }
+
+    private static String tuneString() {
+        StringBuilder sb = new StringBuilder();
+        for (int p = 0; p < tune.length; p++) {
+            if (p > 0) sb.append(' ');
+            sb.append(T_NAME[p]).append('=').append(tune[p]);
+        }
+        return sb.toString();
+    }
+
+    private static Path tuningFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve("spruce_fast_tuning.properties");
+    }
+
+    private static int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private static void loadTuning() {
+        if (!LEARNING) {
+            return;
+        }
+        try {
+            Path f = tuningFile();
+            if (!Files.exists(f)) {
+                return;
+            }
+            Properties pr = new Properties();
+            try (var in = Files.newInputStream(f)) {
+                pr.load(in);
+            }
+            for (int p = 0; p < tune.length; p++) {
+                tune[p] = clamp(Integer.parseInt(pr.getProperty(T_NAME[p], String.valueOf(tune[p]))), T_MIN[p], T_MAX[p]);
+                learnedFloor[p] = clamp(Integer.parseInt(pr.getProperty(T_NAME[p] + ".floor", String.valueOf(learnedFloor[p]))), T_MIN[p], T_MAX[p]);
+            }
+            bestCycleTicks = Integer.parseInt(pr.getProperty("bestCycleTicks", String.valueOf(bestCycleTicks)));
+            LOG.info("[LEARN] loaded saved timing: {}", tuneString());
+        } catch (Exception e) {
+            LOG.warn("[LEARN] could not read saved timing: {}", e.toString());
+        }
+    }
+
+    private static void saveTuning() {
+        try {
+            Properties pr = new Properties();
+            for (int p = 0; p < tune.length; p++) {
+                pr.setProperty(T_NAME[p], String.valueOf(tune[p]));
+                pr.setProperty(T_NAME[p] + ".floor", String.valueOf(learnedFloor[p]));
+            }
+            pr.setProperty("bestCycleTicks", String.valueOf(bestCycleTicks));
+            try (var out = Files.newOutputStream(tuningFile())) {
+                pr.store(out, "Spruce Fast learned timing (delete to reset)");
+            }
+        } catch (Exception e) {
+            LOG.warn("[LEARN] could not save timing: {}", e.toString());
+        }
     }
 
     /* ======================================================== */
