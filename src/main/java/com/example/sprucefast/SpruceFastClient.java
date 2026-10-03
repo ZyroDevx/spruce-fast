@@ -5,6 +5,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.Element;
@@ -25,12 +26,18 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 
+import net.minecraft.screen.CraftingScreenHandler;
 import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 
 import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
@@ -55,8 +62,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static final int TARGET_LOGS   = 576;   // 9 stacks
     private static final int PRICE_PER_LOG = 53;
-    private static final int LOGS_PER_TRIP = 192;   // craft 3 stacks, then sell (keeps inventory from filling)
-    private static final int POLL_TICKS    = 600;   // re-check /orders every 30 s
+    private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
+    private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
     private static final boolean LOOP      = true;  // repeat the whole cycle
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
@@ -69,7 +76,8 @@ public class SpruceFastClient implements ClientModInitializer {
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
         CRAFT_OPEN, CRAFT,
-        SELL_CMD, SELL_GUI
+        TABLE_OPEN, TABLE,
+        SELL_CMD, SELL_GUI, PICKUP_WAIT
     }
 
     private static KeyBinding startKey;
@@ -103,6 +111,11 @@ public class SpruceFastClient implements ClientModInitializer {
     private static boolean yourOrdersClicked = false;
     private static boolean movedPlanks = false;
     private static boolean confirmedSell = false;
+    private static int tableRetries = 0;
+    private static int noProgress = 0;
+    private static int lastGridPlanks = -1;
+    private static int pickupLastCount = -1;
+    private static int pickupStable = 0;
 
     private static Object lastScreen = null;
     private static String lastClickKey = "";
@@ -176,6 +189,9 @@ public class SpruceFastClient implements ClientModInitializer {
             case COLLECT_GUI  -> collectGui(c);
             case CRAFT_OPEN   -> craftOpen(c);
             case CRAFT        -> craft(c);
+            case TABLE_OPEN   -> tableOpen(c);
+            case TABLE        -> table(c);
+            case PICKUP_WAIT  -> pickupWait(c);
             case SELL_CMD     -> sellCmd(c);
             case SELL_GUI     -> sellGui(c);
             default -> { }
@@ -184,8 +200,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void start(MinecraftClient c) {
 
-        if (countEmptySlots(c) < TARGET_LOGS / 64) {
-            info(c, "Need at least " + (TARGET_LOGS / 64) + " empty inventory slots.");
+        if (countEmptySlots(c) < REQUIRED_FREE_SLOTS) {
+            info(c, "Empty your inventory first (need " + REQUIRED_FREE_SLOTS + " free slots).");
             return;
         }
 
@@ -193,6 +209,7 @@ public class SpruceFastClient implements ClientModInitializer {
         tripLogs = 0;
         stuckCounter = 0;
         sellAttempts = 0;
+        tableRetries = 0;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -216,9 +233,6 @@ public class SpruceFastClient implements ClientModInitializer {
         guiClicks = 0;
         lastClickKey = "";
         lastScreen = null;
-        if (p == Phase.ORDER_WAIT) {
-            orderFilled = false;
-        }
     }
 
     /* ======================================================== */
@@ -227,10 +241,16 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void onChat(String msg) {
 
-        if (phase == Phase.ORDER_WAIT
-                && msg.contains("order")
-                && (msg.contains("filled") || msg.contains("completed")
-                    || msg.contains("fulfilled") || msg.contains("ready"))) {
+        if (phase != Phase.ORDER_GUI && phase != Phase.ORDER_WAIT) {
+            return;
+        }
+
+        // "<player> delivered you ..." or "Your <item> order ... filled/completed/ready"
+        if (msg.contains("delivered")
+                || (msg.contains("order")
+                    && (msg.contains("filled") || msg.contains("completed")
+                        || msg.contains("fulfilled") || msg.contains("ready")
+                        || msg.contains("collect")))) {
             orderFilled = true;
         }
     }
@@ -243,6 +263,7 @@ public class SpruceFastClient implements ClientModInitializer {
         orderStep = 0;
         textSet = false;
         dialogScreen = null;
+        orderFilled = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.ORDER_GUI);
         cooldown = 0;
@@ -311,13 +332,13 @@ public class SpruceFastClient implements ClientModInitializer {
 
         /* ---------- step 7: "Create Order" was pressed ---------- */
         if (orderStep == 7) {
-            if (tickCounter - lastPressTick >= 6) {
+            if (tickCounter - lastPressTick >= 3) {
                 closeScreens(c);
                 if (c.currentScreen != null) {
                     c.setScreen(null);
                 }
-                info(c, "Order created. Waiting for it to fill...");
-                setPhase(Phase.ORDER_WAIT);
+                info(c, "Order created. Collecting...");
+                setPhase(Phase.COLLECT_CMD);
             }
             return;
         }
@@ -394,11 +415,21 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void orderWait(MinecraftClient c) {
 
+        if (orderFilled) {
+            setPhase(Phase.COLLECT_CMD);
+            return;
+        }
+
+        // The server may re-open the /orders menu after creating the order.
+        if (openContainer(c) != null) {
+            closeScreens(c);
+        }
+
         if (phaseTicks % 100 == 0) {
             info(c, "Waiting for order... " + (phaseTicks / 20) + "s");
         }
 
-        if (orderFilled || (phaseTicks > 0 && phaseTicks % POLL_TICKS == 0)) {
+        if (phaseTicks > 0 && phaseTicks % POLL_TICKS == 0) {
             setPhase(Phase.COLLECT_CMD);
         }
     }
@@ -410,6 +441,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void collectCmd(MinecraftClient c) {
         logsAtCollectStart = count(c, Items.SPRUCE_LOG);
         movedAny = false;
+        orderFilled = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.COLLECT_GUI);
     }
@@ -430,7 +462,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (phaseTicks > 400) {
+        if (phaseTicks > 80) {
             if (gained > 0) {
                 finishCollect(c, gained);
             } else {
@@ -498,7 +530,11 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void craftOpen(MinecraftClient c) {
 
         if (count(c, Items.SPRUCE_LOG) == 0) {
-            afterSell(c);
+            if (count(c, Items.SPRUCE_PLANKS) >= 3) {
+                setPhase(Phase.TABLE_OPEN);
+            } else {
+                afterSell(c);
+            }
             return;
         }
 
@@ -549,15 +585,12 @@ public class SpruceFastClient implements ClientModInitializer {
 
         int ls = findSlotWith(h, Items.SPRUCE_LOG);
 
-        if (ls == -1 || tripLogs >= LOGS_PER_TRIP) {
+        if (ls == -1) {
             c.player.closeHandledScreen();
-            tripLogs = 0;
-            setPhase(Phase.SELL_CMD);
-            cooldown = 8;
+            setPhase(Phase.TABLE_OPEN);
+            cooldown = 6;
             return;
         }
-
-        tripLogs += h.getSlot(ls).getStack().getCount();
 
         click(c, h, ls, SlotActionType.PICKUP);
         click(c, h, 1, SlotActionType.PICKUP);
@@ -570,13 +603,264 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /* ======================================================== */
-    /*                          SELLING                         */
+    /*              SLABS (crafting table, Ctrl+Q drops)        */
     /* ======================================================== */
+
+    /*
+     * CraftingScreenHandler slots:
+     *   0 = result, 1-9 = grid, 10-36 = inventory, 37-45 = hotbar
+     */
+    private static final int T_INV_FROM = 10;
+    private static final int T_INV_TO   = 46;
+
+    private static void tableOpen(MinecraftClient c) {
+
+        if (count(c, Items.SPRUCE_PLANKS) < 3) {
+            enterPickupWait();
+            return;
+        }
+
+        BlockPos pos = findCraftingTable(c);
+
+        if (pos == null) {
+            stop(c, "No crafting table within reach. Place one next to you.");
+            return;
+        }
+
+        // Look straight down so Ctrl+Q drops land at our feet (and get picked up again later).
+        c.player.setPitch(90.0f);
+
+        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+        c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
+
+        noProgress = 0;
+        lastGridPlanks = -1;
+        setPhase(Phase.TABLE);
+    }
+
+    private static void table(MinecraftClient c) {
+
+        if (phaseTicks > 6000) {
+            stop(c, "Slab crafting timed out.");
+            return;
+        }
+
+        if (!(c.player.currentScreenHandler instanceof CraftingScreenHandler h)) {
+            if (phaseTicks > 30) {
+                if (++tableRetries > 3) {
+                    stop(c, "Could not open the crafting table.");
+                } else {
+                    setPhase(Phase.TABLE_OPEN);
+                }
+            }
+            return;
+        }
+
+        tableRetries = 0;
+
+        // Anything stuck on the cursor goes back into the inventory first.
+        if (!h.getCursorStack().isEmpty()) {
+            if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
+                stop(c, "Cursor holds an item and there is no free slot.");
+            }
+            cooldown = 1;
+            return;
+        }
+
+        /*
+         * A) Inventory is full -> Ctrl+Q (drop the WHOLE stack) on every slab stack.
+         */
+        if (countFree(h, T_INV_FROM, T_INV_TO) == 0
+                && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
+
+            for (int i = T_INV_FROM; i < T_INV_TO; i++) {
+                if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
+                    c.interactionManager.clickSlot(h.syncId, i, 1, SlotActionType.THROW, c.player);
+                }
+            }
+
+            cooldown = 2;
+            return;
+        }
+
+        /*
+         * B) Planks in the grid -> shift-click the result (crafts everything in the grid).
+         */
+        int gridPlanks = 0;
+        boolean gridHas = false;
+
+        for (int i = 1; i <= 9; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isEmpty()) {
+                continue;
+            }
+            gridHas = true;
+            if (!st.isOf(Items.SPRUCE_PLANKS)) {
+                stop(c, "Remove other items from the crafting grid.");
+                return;
+            }
+            gridPlanks += st.getCount();
+        }
+
+        if (gridHas) {
+
+            if (gridPlanks == lastGridPlanks) {
+                if (++noProgress >= 6) {
+                    // Leftover planks that can't form a recipe -> back to the inventory.
+                    for (int i = 1; i <= 9; i++) {
+                        if (!h.getSlot(i).getStack().isEmpty()) {
+                            click(c, h, i, SlotActionType.QUICK_MOVE);
+                        }
+                    }
+                    noProgress = 0;
+                    lastGridPlanks = -1;
+                    cooldown = 2;
+                    return;
+                }
+            } else {
+                noProgress = 0;
+                lastGridPlanks = gridPlanks;
+            }
+
+            click(c, h, 0, SlotActionType.QUICK_MOVE);
+            cooldown = 2;
+            return;
+        }
+
+        lastGridPlanks = -1;
+        noProgress = 0;
+
+        /*
+         * C) Grid empty -> load the next planks, or finish.
+         */
+        int stacks = stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+        int biggest = biggestStack(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+
+        if (biggest < 3 && stacks < 3) {
+            c.player.closeHandledScreen();
+            info(c, "Slabs crafted. Picking up and selling...");
+            enterPickupWait();
+            return;
+        }
+
+        int[] cells = {7, 8, 9};
+
+        if (stacks >= 3) {
+
+            // three full stacks side by side (bottom row) -> up to 384 slabs per shift-click
+            for (int k = 0; k < 3; k++) {
+                int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+                if (ps == -1) {
+                    break;
+                }
+                click(c, h, ps, SlotActionType.PICKUP);
+                click(c, h, cells[k], SlotActionType.PICKUP);
+                if (!h.getCursorStack().isEmpty()) {
+                    click(c, h, ps, SlotActionType.PICKUP);
+                }
+            }
+
+        } else {
+
+            // fewer than 3 stacks: pick one up and drag-split it across the 3 cells
+            int ps = findIn(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+            click(c, h, ps, SlotActionType.PICKUP);
+
+            c.interactionManager.clickSlot(h.syncId, -999,
+                ScreenHandler.packQuickCraftData(0, 0), SlotActionType.QUICK_CRAFT, c.player);
+
+            for (int cell : cells) {
+                c.interactionManager.clickSlot(h.syncId, cell,
+                    ScreenHandler.packQuickCraftData(1, 0), SlotActionType.QUICK_CRAFT, c.player);
+            }
+
+            c.interactionManager.clickSlot(h.syncId, -999,
+                ScreenHandler.packQuickCraftData(2, 0), SlotActionType.QUICK_CRAFT, c.player);
+        }
+
+        cooldown = 3; // the server has to compute the recipe result
+    }
+
+    private static BlockPos findCraftingTable(MinecraftClient c) {
+
+        BlockPos base = c.player.getBlockPos();
+        Vec3d eye = c.player.getEyePos();
+
+        BlockPos best = null;
+        double bestD = 4.4 * 4.4;
+
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -4; dz <= 4; dz++) {
+
+                    BlockPos p = base.add(dx, dy, dz);
+
+                    if (!c.world.getBlockState(p).isOf(Blocks.CRAFTING_TABLE)) {
+                        continue;
+                    }
+
+                    double d = eye.squaredDistanceTo(Vec3d.ofCenter(p));
+
+                    if (d < bestD) {
+                        bestD = d;
+                        best = p;
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    /* ======================================================== */
+    /*                  PICK UP + SELL (one shot)               */
+    /* ======================================================== */
+
+    private static void enterPickupWait() {
+        pickupLastCount = -1;
+        pickupStable = 0;
+        setPhase(Phase.PICKUP_WAIT);
+    }
+
+    /*
+     * Dropped slabs lie at our feet and are picked up again automatically as soon as
+     * the inventory has room. Sell whatever is in the inventory once it stops growing,
+     * then repeat until nothing more shows up.
+     */
+    private static void pickupWait(MinecraftClient c) {
+
+        if (c.currentScreen instanceof HandledScreen<?>) {
+            closeScreens(c);
+        }
+
+        int slabs = count(c, Items.SPRUCE_SLAB);
+
+        if (slabs > 0) {
+
+            if (slabs == pickupLastCount) {
+                pickupStable++;
+            } else {
+                pickupLastCount = slabs;
+                pickupStable = 0;
+            }
+
+            if (pickupStable >= 8) {
+                setPhase(Phase.SELL_CMD);
+            }
+
+            phaseTicks = 0; // keep waiting while slabs are present
+            return;
+        }
+
+        if (phaseTicks > 100) { // nothing left on the ground
+            afterSell(c);
+        }
+    }
 
     private static void sellCmd(MinecraftClient c) {
 
-        if (count(c, Items.SPRUCE_PLANKS) == 0) {
-            afterSell(c);
+        if (count(c, Items.SPRUCE_SLAB) == 0) {
+            enterPickupWait();
             return;
         }
 
@@ -584,7 +868,6 @@ public class SpruceFastClient implements ClientModInitializer {
         confirmedSell = false;
         c.player.networkHandler.sendChatCommand(SELL_COMMAND);
         setPhase(Phase.SELL_GUI);
-        cooldown = 10;
     }
 
     private static void sellGui(MinecraftClient c) {
@@ -592,7 +875,7 @@ public class SpruceFastClient implements ClientModInitializer {
         HandledScreen<?> hs = openContainer(c);
 
         if (hs == null) {
-            if (phaseTicks > 200) {
+            if (phaseTicks > 100) {
                 stop(c, "Sell GUI never opened. Check logs/latest.log.");
             }
             return;
@@ -603,11 +886,11 @@ public class SpruceFastClient implements ClientModInitializer {
         ScreenHandler h = hs.getScreenHandler();
         int cs = containerSize(h);
 
-        // 1) move planks from player inventory into the sell GUI (6 per tick)
+        // 1) ONE SHOT: shift-click every slab (and leftover plank) stack into the sell GUI at once
         if (!movedPlanks) {
-            if (!quickMoveAll(c, h, cs, h.slots.size(), Items.SPRUCE_PLANKS)) {
-                movedPlanks = true;
-            }
+            quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_SLAB);
+            quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_PLANKS);
+            movedPlanks = true;
             cooldown = 3;
             return;
         }
@@ -618,7 +901,7 @@ public class SpruceFastClient implements ClientModInitializer {
             int s = find(h, cs, "confirm", "sell all", "accept");
             if (s != -1) {
                 click(c, h, s, SlotActionType.PICKUP);
-                cooldown = 10;
+                cooldown = 6;
                 return;
             }
         }
@@ -628,14 +911,8 @@ public class SpruceFastClient implements ClientModInitializer {
             c.player.closeHandledScreen();
         }
 
-        sellAttempts++;
-        cooldown = 15;
-
-        if (count(c, Items.SPRUCE_PLANKS) > 0 && sellAttempts < 3) {
-            setPhase(Phase.SELL_CMD);
-        } else {
-            afterSell(c);
-        }
+        cooldown = 10;
+        enterPickupWait();
     }
 
     private static void afterSell(MinecraftClient c) {
@@ -657,7 +934,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
             collectedTotal = 0;
 
-            if (countEmptySlots(c) < TARGET_LOGS / 64) {
+            if (countEmptySlots(c) < REQUIRED_FREE_SLOTS) {
                 stop(c, "Not enough free slots for the next batch.");
                 return;
             }
@@ -887,6 +1164,59 @@ public class SpruceFastClient implements ClientModInitializer {
         for (ClickableWidget w : ws) {
             LOG.info("  {} '{}'", w.getClass().getSimpleName(), w.getMessage().getString());
         }
+    }
+
+    /* ---------- generic slot-range helpers (any ScreenHandler) ---------- */
+
+    private static int countFree(ScreenHandler h, int from, int to) {
+        int n = 0;
+        for (int i = from; i < to; i++) {
+            if (h.getSlot(i).getStack().isEmpty()) n++;
+        }
+        return n;
+    }
+
+    private static int countOf(ScreenHandler h, Item item, int from, int to) {
+        int n = 0;
+        for (int i = from; i < to; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isOf(item)) n += st.getCount();
+        }
+        return n;
+    }
+
+    private static int stacksOf(ScreenHandler h, Item item, int from, int to) {
+        int n = 0;
+        for (int i = from; i < to; i++) {
+            if (h.getSlot(i).getStack().isOf(item)) n++;
+        }
+        return n;
+    }
+
+    private static int biggestStack(ScreenHandler h, Item item, int from, int to) {
+        int best = 0;
+        for (int i = from; i < to; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isOf(item) && st.getCount() > best) best = st.getCount();
+        }
+        return best;
+    }
+
+    private static int findIn(ScreenHandler h, Item item, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (h.getSlot(i).getStack().isOf(item)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean putCursorAway(MinecraftClient c, ScreenHandler h, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (h.getSlot(i).getStack().isEmpty()) {
+                click(c, h, i, SlotActionType.PICKUP);
+                return true;
+            }
+        }
+        return false;
     }
 
     /* ---------- player inventory (PlayerScreenHandler indexes) ---------- */
