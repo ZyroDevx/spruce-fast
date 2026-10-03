@@ -6,6 +6,14 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.Click;
+import net.minecraft.client.gui.Element;
+import net.minecraft.client.gui.ParentElement;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ClickableWidget;
+import net.minecraft.client.gui.widget.PressableWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.client.input.MouseInput;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.option.KeyBinding;
@@ -28,6 +36,9 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Cycle: /orders (buy 576 spruce logs @ 52 each) -> wait -> collect
  *        -> craft planks -> /sell planks -> repeat.
@@ -40,10 +51,10 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static final String ORDER_COMMAND = "orders";   // no slash
     private static final String SELL_COMMAND  = "sell";     // no slash
-    private static final String ORDER_ITEM_NAME = "spruce log";
+    private static final String ORDER_ITEM_NAME = "Spruce logs"; // text typed in the search box
 
     private static final int TARGET_LOGS   = 576;   // 9 stacks
-    private static final int PRICE_PER_LOG = 52;
+    private static final int PRICE_PER_LOG = 53;
     private static final int LOGS_PER_TRIP = 192;   // craft 3 stacks, then sell (keeps inventory from filling)
     private static final int POLL_TICKS    = 600;   // re-check /orders every 30 s
     private static final boolean LOOP      = true;  // repeat the whole cycle
@@ -82,6 +93,9 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int guiClicks = 0;
 
     private static boolean itemPicked = false;
+    private static int orderStep = 0;
+    private static boolean textSet = false;
+    private static Object lastWidgetScreen = null;
     private static boolean yourOrdersClicked = false;
     private static boolean movedPlanks = false;
     private static boolean confirmedSell = false;
@@ -209,36 +223,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void onChat(String msg) {
 
-        if (phase == Phase.ORDER_GUI) {
-
-            if (msg.contains("order")
-                    && (msg.contains("created") || msg.contains("placed")
-                        || msg.contains("success") || msg.contains("listed"))) {
-                orderPlaced = true;
-                return;
-            }
-
-            if (tickCounter - lastReplyTick < 10) {
-                return;
-            }
-
-            String reply = null;
-
-            if (msg.contains("price")) {
-                reply = String.valueOf(PRICE_PER_LOG);
-            } else if (msg.contains("amount") || msg.contains("quantity") || msg.contains("how many")) {
-                reply = String.valueOf(TARGET_LOGS);
-            } else if ((msg.contains("item") || msg.contains("search") || msg.contains("name"))
-                    && (msg.contains("type") || msg.contains("enter") || msg.contains("chat"))) {
-                reply = ORDER_ITEM_NAME;
-            }
-
-            if (reply != null) {
-                pendingChat = reply;
-                lastReplyTick = tickCounter;
-            }
-        }
-
         if (phase == Phase.ORDER_WAIT
                 && msg.contains("order")
                 && (msg.contains("filled") || msg.contains("completed")
@@ -252,69 +236,133 @@ public class SpruceFastClient implements ClientModInitializer {
     /* ======================================================== */
 
     private static void orderCmd(MinecraftClient c) {
-        orderPlaced = false;
-        itemPicked = false;
+        orderStep = 0;
+        textSet = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.ORDER_GUI);
         cooldown = 10;
     }
 
+    /*
+     * Walkthrough:
+     * 0  /orders chest menu      -> click "Your Orders"
+     * 1  Your Orders chest menu  -> click "New Order"
+     * 2  Choose Item dialog      -> type "Spruce logs", press Search
+     * 3  Search results          -> press "Spruce Log"
+     * 4  Amount dialog           -> type 576, press Next
+     * 5  Price dialog            -> type 53, press Review Order
+     * 6  Review dialog           -> press Create Order
+     */
     private static void orderGui(MinecraftClient c) {
 
-        if (orderPlaced) {
-            closeScreens(c);
-            info(c, "Order placed. Waiting for it to fill...");
-            setPhase(Phase.ORDER_WAIT);
-            return;
-        }
-
         if (phaseTicks > 1200) {
-            stop(c, "Order setup timed out. Check logs/latest.log [SpruceFast].");
+            stop(c, "Order setup timed out at step " + orderStep + ". Check logs/latest.log.");
             return;
         }
 
         HandledScreen<?> hs = openContainer(c);
-        if (hs == null) {
-            return; // waiting for GUI or a chat prompt
-        }
 
-        dump(hs);
+        /* ---------- steps 0-1: chest menus ---------- */
+        if (orderStep <= 1) {
 
-        if (guiClicks >= 30) {
-            stop(c, "Too many clicks in order GUI. Check logs/latest.log.");
-            return;
-        }
-
-        ScreenHandler h = hs.getScreenHandler();
-        int cs = containerSize(h);
-        String title = hs.getTitle().getString().toLowerCase();
-
-        // Safety: never stay in a screen that delivers items to someone else's order.
-        if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
-            stop(c, "Opened a deliver screen. Aborted. Check logs/latest.log.");
-            return;
-        }
-
-        int s = find(h, cs, "confirm", "place order", "submit");
-        if (s == -1) {
-            s = find(h, cs, "new order", "create order", "make order", "create new");
-        }
-
-        // Only pick the item on an item-selection screen, never in the order list
-        // (spruce logs in the list are OTHER players' orders = deliver).
-        if (s == -1 && !itemPicked
-                && (title.contains("select") || title.contains("choose")
-                    || title.contains("pick") || title.contains("search")
-                    || title.contains("category"))) {
-            s = findItem(h, cs, Items.SPRUCE_LOG);
-            if (s != -1) {
-                itemPicked = true;
+            if (hs == null) {
+                return;
             }
+
+            dump(hs);
+
+            ScreenHandler h = hs.getScreenHandler();
+            int cs = containerSize(h);
+            String title = hs.getTitle().getString().toLowerCase();
+
+            if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
+                stop(c, "Opened a deliver screen. Aborted.");
+                return;
+            }
+
+            int s = find(h, cs, "new order");
+
+            if (s == -1 && title.contains("your orders")) {
+                s = 0; // "New Order" is the first slot
+            }
+
+            if (s != -1) {
+                click(c, h, s, SlotActionType.PICKUP);
+                orderStep = 2;
+                textSet = false;
+                cooldown = 15;
+                return;
+            }
+
+            s = find(h, cs, "your orders");
+            if (s != -1 && clickOnce(c, hs, h, s)) {
+                orderStep = 1;
+                cooldown = 12;
+            }
+
+            return;
         }
 
-        if (s != -1 && clickOnce(c, hs, h, s)) {
-            guiClicks++;
-            cooldown = 8;
+        /* ---------- steps 2-6: dialog screens ---------- */
+        if (hs != null || c.currentScreen == null) {
+            return; // old chest still closing, or dialog not open yet
+        }
+
+        List<ClickableWidget> ws = widgets(c.currentScreen);
+        dumpWidgets(c.currentScreen, ws);
+
+        switch (orderStep) {
+
+            case 2 -> {
+                if (typeAndPress(c, ws, ORDER_ITEM_NAME, "search")) {
+                    orderStep = 3;
+                    cooldown = 20; // let the results load
+                }
+            }
+
+            case 3 -> {
+                ClickableWidget item = spruceLogButton(ws);
+                if (item != null) {
+                    pressButton(item);
+                    orderStep = 4;
+                    textSet = false;
+                    cooldown = 15;
+                }
+            }
+
+            case 4 -> {
+                if (typeAndPress(c, ws, String.valueOf(TARGET_LOGS), "next")) {
+                    orderStep = 5;
+                    cooldown = 15;
+                }
+            }
+
+            case 5 -> {
+                if (typeAndPress(c, ws, String.valueOf(PRICE_PER_LOG), "review order")) {
+                    orderStep = 6;
+                    cooldown = 15;
+                }
+            }
+
+            case 6 -> {
+                ClickableWidget create = button(ws, "create order");
+                if (create != null) {
+                    pressButton(create);
+                    orderStep = 7;
+                    cooldown = 20;
+                }
+            }
+
+            case 7 -> {
+                closeScreens(c);
+                if (c.currentScreen != null) {
+                    c.setScreen(null);
+                }
+                info(c, "Order created. Waiting for it to fill...");
+                setPhase(Phase.ORDER_WAIT);
+            }
+
+            default -> { }
         }
     }
 
@@ -722,6 +770,105 @@ public class SpruceFastClient implements ClientModInitializer {
             if (!s.isEmpty()) {
                 LOG.info("  slot {} -> {}", i, textOf(s));
             }
+        }
+    }
+
+    /* ---------- dialog screen (widget) helpers ---------- */
+
+    private static List<ClickableWidget> widgets(Screen screen) {
+        List<ClickableWidget> out = new ArrayList<>();
+        collectWidgets(screen.children(), out);
+        return out;
+    }
+
+    private static void collectWidgets(List<? extends Element> elements, List<ClickableWidget> out) {
+        for (Element e : elements) {
+            if (e instanceof ClickableWidget w && !out.contains(w)) {
+                out.add(w);
+            }
+            if (e instanceof ParentElement p) {
+                collectWidgets(p.children(), out);
+            }
+        }
+    }
+
+    private static TextFieldWidget firstTextField(List<ClickableWidget> ws) {
+        for (ClickableWidget w : ws) {
+            if (w instanceof TextFieldWidget tf) {
+                return tf;
+            }
+        }
+        return null;
+    }
+
+    /** Pressable button whose text equals the label (ignores case). */
+    private static ClickableWidget button(List<ClickableWidget> ws, String label) {
+        for (ClickableWidget w : ws) {
+            if (w instanceof PressableWidget
+                    && w.getMessage().getString().trim().equalsIgnoreCase(label)) {
+                return w;
+            }
+        }
+        return null;
+    }
+
+    /** The "Spruce Log" result button (not stripped logs, not "Spruce Logs" labels). */
+    private static ClickableWidget spruceLogButton(List<ClickableWidget> ws) {
+        for (ClickableWidget w : ws) {
+            if (!(w instanceof PressableWidget)) {
+                continue;
+            }
+            String t = w.getMessage().getString().trim().toLowerCase();
+            if (t.endsWith("spruce log") && !t.contains("stripped")) {
+                return w;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * First call: types the text. Second call (a few ticks later): presses the button.
+     * Returns true once the button was pressed.
+     */
+    private static boolean typeAndPress(MinecraftClient c, List<ClickableWidget> ws, String text, String label) {
+
+        TextFieldWidget tf = firstTextField(ws);
+        ClickableWidget b = button(ws, label);
+
+        if (tf == null || b == null) {
+            return false;
+        }
+
+        if (!textSet) {
+            tf.setText(text);
+            textSet = true;
+            cooldown = 5;
+            return false;
+        }
+
+        textSet = false;
+        pressButton(b);
+        return true;
+    }
+
+    /*
+     * Simulates a left click in the middle of the widget.
+     * This is the only version-sensitive call (written for Minecraft 1.21.9+).
+     */
+    private static void pressButton(ClickableWidget w) {
+        double x = w.getX() + w.getWidth() / 2.0;
+        double y = w.getY() + w.getHeight() / 2.0;
+        w.mouseClicked(new Click(x, y, new MouseInput(GLFW.GLFW_MOUSE_BUTTON_LEFT, 0)), false);
+    }
+
+    private static void dumpWidgets(Screen screen, List<ClickableWidget> ws) {
+        if (!DEBUG || screen == lastWidgetScreen) {
+            return;
+        }
+        lastWidgetScreen = screen;
+        LOG.info("[ORDER step {}] screen {} widgets:", orderStep, screen.getClass().getSimpleName());
+        for (ClickableWidget w : ws) {
+            LOG.info("  {} '{}'", w.getClass().getSimpleName(), w.getMessage().getString());
         }
     }
 
