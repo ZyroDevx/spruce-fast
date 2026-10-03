@@ -95,6 +95,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static boolean itemPicked = false;
     private static int orderStep = 0;
     private static boolean textSet = false;
+    private static boolean movedAny = false;
     private static Object lastWidgetScreen = null;
     private static boolean yourOrdersClicked = false;
     private static boolean movedPlanks = false;
@@ -240,7 +241,7 @@ public class SpruceFastClient implements ClientModInitializer {
         textSet = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.ORDER_GUI);
-        cooldown = 10;
+        cooldown = 0;
     }
 
     /*
@@ -282,7 +283,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
             int s = find(h, cs, "new order");
 
-            if (s == -1 && title.contains("your orders")) {
+            if (s == -1 && title.contains("your orders") && !h.getSlot(0).getStack().isEmpty()
+                    && !h.getSlot(0).getStack().isOf(Items.SPRUCE_LOG)) {
                 s = 0; // "New Order" is the first slot
             }
 
@@ -290,14 +292,14 @@ public class SpruceFastClient implements ClientModInitializer {
                 click(c, h, s, SlotActionType.PICKUP);
                 orderStep = 2;
                 textSet = false;
-                cooldown = 15;
+                cooldown = 0;
                 return;
             }
 
             s = find(h, cs, "your orders");
             if (s != -1 && clickOnce(c, hs, h, s)) {
                 orderStep = 1;
-                cooldown = 12;
+                cooldown = 0;
             }
 
             return;
@@ -316,7 +318,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case 2 -> {
                 if (typeAndPress(c, ws, ORDER_ITEM_NAME, "search")) {
                     orderStep = 3;
-                    cooldown = 20; // let the results load
+                    cooldown = 0; // let the results load
                 }
             }
 
@@ -326,21 +328,21 @@ public class SpruceFastClient implements ClientModInitializer {
                     pressButton(item);
                     orderStep = 4;
                     textSet = false;
-                    cooldown = 15;
+                    cooldown = 0;
                 }
             }
 
             case 4 -> {
                 if (typeAndPress(c, ws, String.valueOf(TARGET_LOGS), "next")) {
                     orderStep = 5;
-                    cooldown = 15;
+                    cooldown = 0;
                 }
             }
 
             case 5 -> {
                 if (typeAndPress(c, ws, String.valueOf(PRICE_PER_LOG), "review order")) {
                     orderStep = 6;
-                    cooldown = 15;
+                    cooldown = 0;
                 }
             }
 
@@ -349,7 +351,7 @@ public class SpruceFastClient implements ClientModInitializer {
                 if (create != null) {
                     pressButton(create);
                     orderStep = 7;
-                    cooldown = 20;
+                    cooldown = 0;
                 }
             }
 
@@ -383,12 +385,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void collectCmd(MinecraftClient c) {
         logsAtCollectStart = count(c, Items.SPRUCE_LOG);
-        yourOrdersClicked = false;
+        movedAny = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.COLLECT_GUI);
-        cooldown = 10;
     }
 
+    /*
+     * Walkthrough (decided by the menu title, one action per menu, no delays):
+     *   "Orders (Page 1)"        -> click the "Your Orders" chest
+     *   "Orders -> Your Orders"  -> click the spruce log order
+     *   "Orders -> Edit Order"   -> click the "Collect" chest
+     *   "Orders -> Collect Items"-> shift-click all spruce logs
+     */
     private static void collectGui(MinecraftClient c) {
 
         int gained = count(c, Items.SPRUCE_LOG) - logsAtCollectStart;
@@ -398,7 +406,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (phaseTicks > 600) {
+        if (phaseTicks > 400) {
             if (gained > 0) {
                 finishCollect(c, gained);
             } else {
@@ -416,58 +424,38 @@ public class SpruceFastClient implements ClientModInitializer {
 
         dump(hs);
 
-        if (guiClicks >= 25) {
-            closeScreens(c);
-            setPhase(Phase.ORDER_WAIT);
-            return;
-        }
-
         ScreenHandler h = hs.getScreenHandler();
         int cs = containerSize(h);
         String title = hs.getTitle().getString().toLowerCase();
 
-        int s = find(h, cs, "collect", "claim", "withdraw", "take all");
+        if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
+            stop(c, "Opened a deliver screen. Aborted.");
+            return;
+        }
+
+        if (title.contains("collect items")) {
+
+            if (quickMoveAllNow(c, h, 0, cs, Items.SPRUCE_LOG)) {
+                movedAny = true;
+            } else if (movedAny) {
+                finishCollect(c, count(c, Items.SPRUCE_LOG) - logsAtCollectStart);
+            }
+
+            return;
+        }
+
+        int s;
+
+        if (title.contains("edit order")) {
+            s = find(h, cs, "collect");
+        } else if (title.contains("your orders")) {
+            s = findItem(h, cs, Items.SPRUCE_LOG);
+        } else {
+            s = find(h, cs, "your orders");
+        }
 
         if (s != -1) {
-            if (clickOnce(c, hs, h, s)) {
-                guiClicks++;
-            }
-            cooldown = 6;
-            return;
-        }
-
-        if (title.contains("storage") || title.contains("delivery")
-                || title.contains("collect") || title.contains("claim")) {
-            if (quickMoveAll(c, h, 0, cs, Items.SPRUCE_LOG)) {
-                cooldown = 6;
-                return;
-            }
-        }
-
-        if (!yourOrdersClicked) {
-            s = find(h, cs, "your order", "my order", "view order");
-            if (s != -1) {
-                yourOrdersClicked = true;
-                click(c, h, s, SlotActionType.PICKUP);
-                guiClicks++;
-                cooldown = 8;
-                return;
-            }
-        }
-
-        if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
-            stop(c, "Opened a deliver screen. Aborted. Check logs/latest.log.");
-            return;
-        }
-
-        // Only open a spruce log order if we are in OUR orders view.
-        boolean ownView = yourOrdersClicked || title.contains("your") || title.contains("my ");
-        if (ownView) {
-            s = findItem(h, cs, Items.SPRUCE_LOG);
-            if (s != -1 && clickOnce(c, hs, h, s)) {
-                guiClicks++;
-                cooldown = 8;
-            }
+            clickOnce(c, hs, h, s);
         }
     }
 
@@ -477,7 +465,6 @@ public class SpruceFastClient implements ClientModInitializer {
         info(c, "Collected " + collectedTotal + "/" + TARGET_LOGS + " logs.");
         tripLogs = 0;
         setPhase(Phase.CRAFT_OPEN);
-        cooldown = 8;
     }
 
     /* ======================================================== */
@@ -741,6 +728,18 @@ public class SpruceFastClient implements ClientModInitializer {
         return true;
     }
 
+    /** Shift-clicks EVERY matching slot in [from, to) in one tick. */
+    private static boolean quickMoveAllNow(MinecraftClient c, ScreenHandler h, int from, int to, Item item) {
+        boolean any = false;
+        for (int i = from; i < to; i++) {
+            if (h.getSlot(i).getStack().isOf(item)) {
+                click(c, h, i, SlotActionType.QUICK_MOVE);
+                any = true;
+            }
+        }
+        return any;
+    }
+
     /** Shift-clicks up to 6 matching slots in [from, to). Returns true if anything was clicked. */
     private static boolean quickMoveAll(MinecraftClient c, ScreenHandler h, int from, int to, Item item) {
         int done = 0;
@@ -755,11 +754,15 @@ public class SpruceFastClient implements ClientModInitializer {
 
     /** Logs a GUI once so we can see exact titles and button names. */
     private static void dump(HandledScreen<?> hs) {
-        if (!DEBUG || hs == lastScreen) {
+        if (hs == lastScreen) {
             return;
         }
         lastScreen = hs;
         lastClickKey = "";
+
+        if (!DEBUG) {
+            return;
+        }
 
         ScreenHandler h = hs.getScreenHandler();
         int cs = containerSize(h);
@@ -826,10 +829,7 @@ public class SpruceFastClient implements ClientModInitializer {
         return null;
     }
 
-    /**
-     * First call: types the text. Second call (a few ticks later): presses the button.
-     * Returns true once the button was pressed.
-     */
+    /** Types the text and presses the button in the same tick. */
     private static boolean typeAndPress(MinecraftClient c, List<ClickableWidget> ws, String text, String label) {
 
         TextFieldWidget tf = firstTextField(ws);
@@ -839,14 +839,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return false;
         }
 
-        if (!textSet) {
-            tf.setText(text);
-            textSet = true;
-            cooldown = 5;
-            return false;
-        }
-
-        textSet = false;
+        tf.setText(text);
         pressButton(b);
         return true;
     }
