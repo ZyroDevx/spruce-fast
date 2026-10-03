@@ -4,7 +4,6 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 
-import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
@@ -12,20 +11,11 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 
-import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 
 import net.minecraft.text.Text;
-
-import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
-
-import net.minecraft.util.hit.BlockHitResult;
-
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.util.math.Vec3d;
 
 import org.lwjgl.glfw.GLFW;
 
@@ -35,11 +25,16 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static boolean enabled = false;
 
-    private static BlockPos craftingTable = null;
+    /*
+     * How many crafting-result clicks to send
+     * each client tick.
+     *
+     * Higher = faster, but servers can reject
+     * excessive inventory packets.
+     */
+    private static final int CRAFTS_PER_TICK = 8;
 
     private static int timer = 0;
-
-    private static final int SEARCH_RADIUS = 32;
 
     @Override
     public void onInitializeClient() {
@@ -60,17 +55,14 @@ public class SpruceFastClient implements ClientModInitializer {
             while (startKey.wasPressed()) {
 
                 enabled = !enabled;
-
-                craftingTable = null;
                 timer = 0;
 
-                stopWalking(client);
-
                 if (client.player != null) {
+
                     client.player.sendMessage(
                         Text.literal(
-                            "Spruce Fast: " +
-                            (enabled ? "ON" : "OFF")
+                            "Spruce Fast: "
+                                + (enabled ? "ON" : "OFF")
                         ),
                         true
                     );
@@ -82,14 +74,13 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             if (client.player == null ||
-                client.world == null ||
                 client.interactionManager == null) {
                 return;
             }
 
             timer++;
 
-            if (timer < 2) {
+            if (timer < 1) {
                 return;
             }
 
@@ -101,245 +92,38 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void run(MinecraftClient client) {
 
-        // Stop if there are no spruce logs.
-        if (countLogs(client) <= 0) {
-
-            stopWalking(client);
-
-            if (client.player.currentScreenHandler
-                    instanceof CraftingScreenHandler) {
-                client.player.closeHandledScreen();
-            }
-
-            enabled = false;
-
-            client.player.sendMessage(
-                Text.literal("Spruce Fast: Finished."),
-                true
-            );
-
-            return;
-        }
-
-        // If crafting table is open, craft.
-        if (client.player.currentScreenHandler
-                instanceof CraftingScreenHandler) {
-
-            stopWalking(client);
-
-            craftStack(client);
-
-            return;
-        }
-
-        // Find crafting table.
-        if (craftingTable == null ||
-            !client.world
-                .getBlockState(craftingTable)
-                .isOf(Blocks.CRAFTING_TABLE)) {
-
-            craftingTable = findCraftingTable(client);
-
-            if (craftingTable == null) {
-
-                stopWalking(client);
-
-                enabled = false;
-
-                client.player.sendMessage(
-                    Text.literal(
-                        "Spruce Fast: No crafting table within "
-                        + SEARCH_RADIUS + " blocks."
-                    ),
-                    true
-                );
-
-                return;
-            }
-        }
-
-        // Distance to crafting table.
-        double distance =
-            client.player
-                .getEntityPos()
-                .distanceTo(
-                    Vec3d.ofCenter(craftingTable)
-                );
-
-        // Walk toward it.
-        if (distance > 3.0) {
-
-            walkToCraftingTable(client);
-
-            return;
-        }
-
-        // Close enough.
-        stopWalking(client);
-
-        openCraftingTable(client);
-    }
-
-    private static BlockPos findCraftingTable(
-            MinecraftClient client) {
-
-        BlockPos playerPos =
-            client.player.getBlockPos();
-
-        BlockPos closest = null;
-
-        double closestDistance =
-            Double.MAX_VALUE;
-
-        for (int x = -SEARCH_RADIUS;
-             x <= SEARCH_RADIUS;
-             x++) {
-
-            for (int y = -8;
-                 y <= 8;
-                 y++) {
-
-                for (int z = -SEARCH_RADIUS;
-                     z <= SEARCH_RADIUS;
-                     z++) {
-
-                    BlockPos pos =
-                        playerPos.add(x, y, z);
-
-                    if (!client.world
-                        .getBlockState(pos)
-                        .isOf(Blocks.CRAFTING_TABLE)) {
-                        continue;
-                    }
-
-                    double distance =
-                        client.player
-                            .getEntityPos()
-                            .squaredDistanceTo(
-                                Vec3d.ofCenter(pos)
-                            );
-
-                    if (distance < closestDistance) {
-
-                        closestDistance = distance;
-                        closest = pos;
-                    }
-                }
-            }
-        }
-
-        return closest;
-    }
-
-    private static void walkToCraftingTable(
-            MinecraftClient client) {
-
-        if (craftingTable == null) {
-            return;
-        }
-
-        Vec3d target =
-            Vec3d.ofCenter(craftingTable);
-
-        Vec3d player =
-            client.player.getEntityPos();
-
-        double dx =
-            target.x - player.x;
-
-        double dz =
-            target.z - player.z;
-
-        double distance =
-            Math.sqrt(dx * dx + dz * dz);
-
-        if (distance < 2.5) {
-
-            stopWalking(client);
-
-            return;
-        }
-
-        float yaw =
-            (float) Math.toDegrees(
-                Math.atan2(-dx, dz)
-            );
-
-        client.player.setYaw(
-            MathHelper.lerpAngleDegrees(
-                0.35f,
-                client.player.getYaw(),
-                yaw
-            )
-        );
-
-        client.options.forwardKey.setPressed(true);
-    }
-
-    private static void stopWalking(
-            MinecraftClient client) {
-
-        client.options.forwardKey.setPressed(false);
-        client.options.backKey.setPressed(false);
-        client.options.leftKey.setPressed(false);
-        client.options.rightKey.setPressed(false);
-    }
-
-    private static void openCraftingTable(
-            MinecraftClient client) {
-
-        if (craftingTable == null) {
-            return;
-        }
-
-        BlockHitResult hitResult =
-            new BlockHitResult(
-                Vec3d.ofCenter(craftingTable),
-                Direction.UP,
-                craftingTable,
-                false
-            );
-
-        client.interactionManager.interactBlock(
-            client.player,
-            Hand.MAIN_HAND,
-            hitResult
-        );
-    }
-
-    /*
-     * Put an ENTIRE spruce-log stack into one
-     * crafting slot, then take the planks.
-     */
-    private static void craftStack(
-            MinecraftClient client) {
-
         if (!(client.player.currentScreenHandler
-                instanceof CraftingScreenHandler)) {
+                instanceof PlayerScreenHandler)) {
+
             return;
         }
 
-        CraftingScreenHandler handler =
-            (CraftingScreenHandler)
+        PlayerScreenHandler handler =
+            (PlayerScreenHandler)
                 client.player.currentScreenHandler;
 
-        // Don't start if the cursor is holding something.
+        /*
+         * Don't do anything if the cursor is holding
+         * an item.
+         */
         if (!handler.getCursorStack().isEmpty()) {
             return;
         }
 
-        int inventorySlot =
-            findLogInventorySlot(client);
-
-        if (inventorySlot == -1) {
+        /*
+         * Make sure the 2x2 crafting grid is empty
+         * before starting.
+         *
+         * We don't want to destroy items the player
+         * manually placed in the crafting grid.
+         */
+        if (!craftingGridIsEmpty(handler)) {
 
             enabled = false;
 
-            client.player.closeHandledScreen();
-
             client.player.sendMessage(
                 Text.literal(
-                    "Spruce Fast: No spruce logs left."
+                    "Spruce Fast: Empty the inventory crafting grid first."
                 ),
                 true
             );
@@ -348,25 +132,57 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * STEP 1
+         * If there is already a spruce log in the
+         * crafting grid, don't put another stack in.
          *
-         * Pick up the ENTIRE spruce-log stack.
+         * This normally happens between clicks while
+         * the server is processing the recipe.
+         */
+        if (hasSpruceLogInCraftingGrid(handler)) {
+
+            takeCraftingResults(client, handler);
+
+            return;
+        }
+
+        /*
+         * Find a spruce-log stack in the player's
+         * inventory.
+         */
+        int logSlot =
+            findLogInventorySlot(client);
+
+        if (logSlot == -1) {
+
+            enabled = false;
+
+            client.player.sendMessage(
+                Text.literal(
+                    "Spruce Fast: Finished. No spruce logs left."
+                ),
+                true
+            );
+
+            return;
+        }
+
+        /*
+         * Put the ENTIRE spruce-log stack into
+         * the first inventory crafting slot.
+         *
+         * PlayerScreenHandler:
+         *
+         * 0 = crafting result
+         * 1-4 = 2x2 crafting input
          */
         client.interactionManager.clickSlot(
             handler.syncId,
-            inventorySlot,
+            logSlot,
             0,
             SlotActionType.PICKUP,
             client.player
         );
 
-        /*
-         * STEP 2
-         *
-         * Left click the first crafting slot.
-         *
-         * This puts the ENTIRE stack there.
-         */
         client.interactionManager.clickSlot(
             handler.syncId,
             1,
@@ -376,83 +192,153 @@ public class SpruceFastClient implements ClientModInitializer {
         );
 
         /*
-         * STEP 3
+         * If anything remains on the cursor,
+         * put it back into the original inventory slot.
          *
-         * Take the crafting result.
-         *
-         * One stack of 64 logs produces
-         * 256 spruce planks.
+         * Normally there shouldn't be anything left,
+         * because the whole stack fits into the
+         * crafting slot.
          */
-        client.interactionManager.clickSlot(
-            handler.syncId,
-            0,
-            0,
-            SlotActionType.QUICK_MOVE,
-            client.player
-        );
+        if (!handler.getCursorStack().isEmpty()) {
+
+            client.interactionManager.clickSlot(
+                handler.syncId,
+                logSlot,
+                0,
+                SlotActionType.PICKUP,
+                client.player
+            );
+        }
+
+        /*
+         * Immediately process crafting.
+         */
+        takeCraftingResults(client, handler);
+    }
+
+    private static void takeCraftingResults(
+            MinecraftClient client,
+            PlayerScreenHandler handler) {
+
+        /*
+         * The result slot is slot 0.
+         *
+         * Each successful crafting-result pickup
+         * consumes ONE spruce log and gives
+         * FOUR spruce planks.
+         *
+         * The whole log stack can remain in the
+         * crafting input while we repeatedly
+         * take the result.
+         */
+        for (int i = 0; i < CRAFTS_PER_TICK; i++) {
+
+            ItemStack result =
+                handler.getOutputSlot().getStack();
+
+            if (result.isEmpty()) {
+                break;
+            }
+
+            if (!result.isOf(Items.SPRUCE_PLANKS)) {
+                break;
+            }
+
+            client.interactionManager.clickSlot(
+                handler.syncId,
+                0,
+                0,
+                SlotActionType.QUICK_MOVE,
+                client.player
+            );
+        }
+    }
+
+    private static boolean craftingGridIsEmpty(
+            PlayerScreenHandler handler) {
+
+        for (var slot : handler.getInputSlots()) {
+
+            if (!slot.getStack().isEmpty()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static boolean hasSpruceLogInCraftingGrid(
+            PlayerScreenHandler handler) {
+
+        for (var slot : handler.getInputSlots()) {
+
+            if (slot.getStack().isOf(Items.SPRUCE_LOG)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static int findLogInventorySlot(
             MinecraftClient client) {
 
-        var mainStacks =
+        var stacks =
             client.player
                 .getInventory()
                 .getMainStacks();
 
-        for (int i = 0;
-             i < mainStacks.size();
-             i++) {
+        /*
+         * PlayerScreenHandler slot layout:
+         *
+         * 0      = crafting result
+         * 1-4    = 2x2 crafting grid
+         * 5-8    = armor
+         * 9-35   = main inventory
+         * 36-44  = hotbar
+         * 45     = offhand
+         */
 
-            ItemStack stack =
-                mainStacks.get(i);
+        /*
+         * Search main inventory + hotbar.
+         *
+         * PlayerInventory indexes:
+         *
+         * 0-8   = hotbar
+         * 9-35  = main inventory
+         */
+        for (int i = 0; i < stacks.size(); i++) {
+
+            ItemStack stack = stacks.get(i);
 
             if (!stack.isOf(Items.SPRUCE_LOG)) {
                 continue;
             }
 
-            /*
-             * Hotbar inventory indexes 0-8
-             * correspond to crafting-screen
-             * slots 37-45.
-             */
             if (i < 9) {
-                return 37 + i;
-            }
 
-            /*
-             * Main inventory indexes 9-35
-             * correspond to crafting-screen
-             * slots 10-36.
-             */
-            return 10 + (i - 9);
-        }
+                // Hotbar inventory index 0-8
+                // -> handler slot 36-44
+                return 36 + i;
 
-        return -1;
-    }
+            } else {
 
-    private static int countLogs(
-            MinecraftClient client) {
-
-        int amount = 0;
-
-        for (ItemStack stack :
-                client.player
-                    .getInventory()
-                    .getMainStacks()) {
-
-            if (stack.isOf(Items.SPRUCE_LOG)) {
-                amount += stack.getCount();
+                // Main inventory index 9-35
+                // -> handler slot 9-35
+                return i;
             }
         }
 
+        /*
+         * Check offhand separately.
+         */
         ItemStack offhand =
             client.player.getOffHandStack();
 
         if (offhand.isOf(Items.SPRUCE_LOG)) {
-            amount += offhand.getCount();
+            return 45;
         }
 
-        return amount;
+        return -1;
     }
 }
