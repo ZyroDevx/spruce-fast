@@ -287,12 +287,25 @@ public class SpruceFastClient implements ClientModInitializer {
 
         ScreenHandler h = hs.getScreenHandler();
         int cs = containerSize(h);
+        String title = hs.getTitle().getString().toLowerCase();
+
+        // Safety: never stay in a screen that delivers items to someone else's order.
+        if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
+            stop(c, "Opened a deliver screen. Aborted. Check logs/latest.log.");
+            return;
+        }
 
         int s = find(h, cs, "confirm", "place order", "submit");
         if (s == -1) {
-            s = find(h, cs, "new order", "create order", "make order");
+            s = find(h, cs, "new order", "create order", "make order", "create new");
         }
-        if (s == -1 && !itemPicked) {
+
+        // Only pick the item on an item-selection screen, never in the order list
+        // (spruce logs in the list are OTHER players' orders = deliver).
+        if (s == -1 && !itemPicked
+                && (title.contains("select") || title.contains("choose")
+                    || title.contains("pick") || title.contains("search")
+                    || title.contains("category"))) {
             s = findItem(h, cs, Items.SPRUCE_LOG);
             if (s != -1) {
                 itemPicked = true;
@@ -394,10 +407,19 @@ public class SpruceFastClient implements ClientModInitializer {
             }
         }
 
-        s = findItem(h, cs, Items.SPRUCE_LOG);
-        if (s != -1 && clickOnce(c, hs, h, s)) {
-            guiClicks++;
-            cooldown = 8;
+        if (title.contains("deliver") || title.contains("fulfill") || title.contains("fill order")) {
+            stop(c, "Opened a deliver screen. Aborted. Check logs/latest.log.");
+            return;
+        }
+
+        // Only open a spruce log order if we are in OUR orders view.
+        boolean ownView = yourOrdersClicked || title.contains("your") || title.contains("my ");
+        if (ownView) {
+            s = findItem(h, cs, Items.SPRUCE_LOG);
+            if (s != -1 && clickOnce(c, hs, h, s)) {
+                guiClicks++;
+                cooldown = 8;
+            }
         }
     }
 
