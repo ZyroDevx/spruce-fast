@@ -1,11 +1,11 @@
 package com.example.sprucefast;
 
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.Click;
@@ -46,16 +46,22 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Properties;
+import java.util.function.Predicate;
 
 /**
- * Cycle: /orders (buy 576 spruce logs @ 52 each) -> wait -> collect
- *        -> craft planks -> /sell planks -> repeat.
+ * Cycle: /orders (buy 576 spruce logs @ 53 each) -> wait -> collect
+ *        -> walk onto the DEEPSLATE block -> crafting table (logs -> planks -> slabs),
+ *           throwing slabs onto the COBBLESTONE area when the inventory fills up
+ *        -> walk onto the COBBLESTONE block -> /sell until no slabs are left
+ *        -> walk back onto the deepslate block -> repeat.
+ *
+ * Farm layout (found automatically within LAYOUT_RADIUS blocks):
+ *   crafting table  - nearest one to the player when the mod is started
+ *   deepslate block - the one nearest to the table  (player stands here to craft + throw)
+ *   cobblestone     - the one nearest to the table  (slabs land here, player stands here to sell)
  *
  * BACKSPACE = start / stop.
  */
@@ -71,41 +77,22 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int PRICE_PER_LOG = 53;
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
-    /* ---------------- SELF-LEARNING TIMING ----------------
-     * The mod starts with safe delays, then tries to shrink them a little every time things
-     * work, and slows down (remembering the value that failed) when something goes wrong:
-     * the table gets closed, a craft makes no progress, or a dialog click has to be repeated.
-     * What it learned is saved in  config/spruce_fast_tuning.properties  and reused next time.
-     * Delete that file to start learning from scratch.
-     */
-    private static final boolean LEARNING = true;
-
-    private static final int T_OPEN = 0, T_GAP = 1, T_SETTLE = 2, T_DIALOG = 3, T_RETRY = 4;
-    private static final String[] T_NAME  = {"openWait", "clickGap", "settle", "dialogSettle", "pressRetry"};
-    // meaning: ticks to wait after the table opens | ticks between clicks | ticks to wait before
-    //          checking a craft | ticks a fresh dialog must exist before we click | ticks before re-clicking
-    private static final int[] T_START = {10, 2, 5, 2, 15};
-    private static final int[] T_MIN   = { 5, 1, 3, 1,  8};   // hard floors: it never goes faster than this
-    private static final int[] T_MAX   = {30, 8, 12, 6, 40};
-
-    private static final int[] tune         = T_START.clone();
-    private static final int[] learnedFloor = T_MIN.clone();   // "this value failed before, don't go below"
-
-    private static final int G_TABLE = 0, G_DIALOG = 1;
-    private static final int[][] GROUP = {{T_OPEN, T_GAP, T_SETTLE}, {T_DIALOG, T_RETRY}};
-    private static final int[] GOOD_NEEDED = {4, 3};   // clean events before one speed-up step
-    private static final int[] goodStreak = new int[2];
-
-    private static int cycleStartTick = 0;
-    private static int cycleFailures = 0;
-    private static int cleanCycles = 0;
-    private static int bestCycleTicks = Integer.MAX_VALUE;
-
-    private static final int WALK_TICKS = 22;   // walk out (and back) this long to collect dropped slabs (~4.7 blocks)
-    private static final double TABLE_REACH  = 3.6;  // walk closer than this before using the table
-    private static final int    TABLE_SEARCH = 10;   // look for the crafting table within this many blocks
     private static final boolean LOOP      = true;  // repeat the whole cycle
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
+
+    /* ---------------- FARM LAYOUT ---------------- */
+    private static final Block STAND_BLOCK = Blocks.DEEPSLATE;    // stand here to use the crafting table + throw slabs
+    private static final Block DROP_BLOCK  = Blocks.COBBLESTONE;  // slabs are thrown here; stand here to sell
+    private static final int    LAYOUT_RADIUS = 16;   // search radius (blocks) for table / deepslate / cobblestone
+    private static final double TABLE_REACH   = 4.4;  // max eye-to-table distance when standing on the deepslate
+    private static final float  THROW_PITCH_TWEAK = 0.0f; // add degrees if slabs land short (-) or long (+)... see notes
+
+    /* ---------------- TIMING (ticks) ---------------- */
+    private static final int OPEN_WAIT     = 10; // wait after the crafting table opens before the first click
+    private static final int CLICK_GAP     = 2;  // ticks between queued inventory clicks
+    private static final int SETTLE        = 5;  // wait after a craft click before checking the result
+    private static final int DIALOG_SETTLE = 2;  // a fresh dialog must exist this long before we click
+    private static final int PRESS_RETRY   = 15; // ticks before re-clicking the same dialog
 
     /* ========================================== */
 
@@ -116,7 +103,8 @@ public class SpruceFastClient implements ClientModInitializer {
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
         TABLE_OPEN, TABLE,
-        SELL_CMD, SELL_GUI, PICKUP_WALK, PICKUP_WAIT
+        GO_DROP, PICKUP_WAIT,
+        SELL_CMD, SELL_GUI
     }
 
     private static KeyBinding startKey;
@@ -127,33 +115,24 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int tickCounter = 0;
 
     private static String pendingChat = null;
-    private static int lastReplyTick = -100;
 
-    private static volatile boolean orderPlaced = false;
     private static volatile boolean orderFilled = false;
 
     private static int collectedTotal = 0;
     private static int logsAtCollectStart = 0;
-    private static int tripLogs = 0;
-    private static int stuckCounter = 0;
-    private static int sellAttempts = 0;
-    private static int guiClicks = 0;
 
-    private static boolean itemPicked = false;
     private static int orderStep = 0;
-    private static boolean textSet = false;
     private static boolean movedAny = false;
     private static Object dialogScreen = null;
     private static int dialogSince = 0;
     private static int lastPressTick = -1000;
     private static Object lastWidgetScreen = null;
-    private static boolean yourOrdersClicked = false;
     private static boolean movedPlanks = false;
     private static boolean confirmedSell = false;
+
     private static int tableRetries = 0;
     private static int noProgress = 0;
     private static int gridReturns = 0;
-    private static float dropYaw = 0f;
     private static int tableAimStage = 0;
     private static boolean droppedAny = false;
     private static int tableSeenSync = -1;
@@ -165,13 +144,18 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int pickupLastCount = -1;
     private static int pickupStable = 0;
 
+    // farm layout (resolved in start())
+    private static BlockPos tablePos = null;
+    private static BlockPos standPos = null;
+    private static BlockPos dropPos  = null;
+    private static float throwYaw = 0f;
+    private static float throwPitch = 0f;
+
     private static Object lastScreen = null;
     private static String lastClickKey = "";
 
     @Override
     public void onInitializeClient() {
-
-        loadTuning();
 
         startKey = KeyBindingHelper.registerKeyBinding(
             new KeyBinding(
@@ -212,7 +196,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (c.player == null || c.interactionManager == null) {
+        if (c.player == null || c.interactionManager == null || c.world == null) {
             phase = Phase.IDLE;
             return;
         }
@@ -239,7 +223,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case COLLECT_GUI  -> collectGui(c);
             case TABLE_OPEN   -> tableOpen(c);
             case TABLE        -> table(c);
-            case PICKUP_WALK  -> pickupWalk(c);
+            case GO_DROP      -> goDrop(c);
             case PICKUP_WAIT  -> pickupWait(c);
             case SELL_CMD     -> sellCmd(c);
             case SELL_GUI     -> sellGui(c);
@@ -254,17 +238,16 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        if (!resolveLayout(c)) {
+            return;
+        }
+
         collectedTotal = 0;
-        tripLogs = 0;
-        stuckCounter = 0;
-        sellAttempts = 0;
         tableRetries = 0;
         tableCloses = 0;
         foreignCount = 0;
         droppedAny = false;
         tableAimStage = 0;
-        cycleStartTick = tickCounter;
-        cycleFailures = 0;
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -287,9 +270,199 @@ public class SpruceFastClient implements ClientModInitializer {
         phase = p;
         clickQueue.clear();
         phaseTicks = 0;
-        guiClicks = 0;
         lastClickKey = "";
         lastScreen = null;
+    }
+
+    /* ======================================================== */
+    /*                       FARM LAYOUT                        */
+    /* ======================================================== */
+
+    /** Finds the crafting table, the deepslate block and the cobblestone block. */
+    private static boolean resolveLayout(MinecraftClient c) {
+
+        tablePos = nearestBlock(c, c.player.getBlockPos(),
+            p -> c.world.getBlockState(p).isOf(Blocks.CRAFTING_TABLE));
+
+        if (tablePos == null) {
+            info(c, "No crafting table found within " + LAYOUT_RADIUS + " blocks.");
+            return false;
+        }
+
+        standPos = nearestBlock(c, tablePos,
+            p -> c.world.getBlockState(p).isOf(STAND_BLOCK) && isFree(c, p.up()) && isFree(c, p.up(2)));
+
+        if (standPos == null) {
+            info(c, "No deepslate block (with free space above) found near the crafting table.");
+            return false;
+        }
+
+        dropPos = nearestBlock(c, tablePos,
+            p -> c.world.getBlockState(p).isOf(DROP_BLOCK) && isFree(c, p.up()));
+
+        if (dropPos == null) {
+            info(c, "No cobblestone block (with free space above) found near the crafting table.");
+            return false;
+        }
+
+        Vec3d eyeAtStand = new Vec3d(standPos.getX() + 0.5, standPos.getY() + 1 + 1.62, standPos.getZ() + 0.5);
+        double reach = eyeAtStand.distanceTo(Vec3d.ofCenter(tablePos));
+
+        if (reach > TABLE_REACH) {
+            info(c, "The crafting table is too far from the deepslate block (" + String.format("%.1f", reach) + " blocks).");
+            return false;
+        }
+
+        LOG.info("Layout: table {}, stand (deepslate) {}, drop (cobblestone) {}", tablePos, standPos, dropPos);
+        return true;
+    }
+
+    private static boolean isFree(MinecraftClient c, BlockPos p) {
+        return c.world.getBlockState(p).getCollisionShape(c.world, p).isEmpty();
+    }
+
+    private static BlockPos nearestBlock(MinecraftClient c, BlockPos center, Predicate<BlockPos> ok) {
+
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+
+        for (int dx = -LAYOUT_RADIUS; dx <= LAYOUT_RADIUS; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -LAYOUT_RADIUS; dz <= LAYOUT_RADIUS; dz++) {
+
+                    BlockPos p = center.add(dx, dy, dz);
+
+                    if (!ok.test(p)) {
+                        continue;
+                    }
+
+                    double d = dx * dx + dy * dy + dz * dz;
+
+                    if (d < bestD) {
+                        bestD = d;
+                        best = p;
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private static boolean onBlock(MinecraftClient c, BlockPos block) {
+        return c.player.getBlockX() == block.getX()
+            && c.player.getBlockZ() == block.getZ()
+            && Math.abs(c.player.getY() - (block.getY() + 1)) < 0.7;
+    }
+
+    /**
+     * Walks onto the middle of a block. Call every tick; returns true once the player
+     * stands still on it.
+     */
+    private static boolean walkTo(MinecraftClient c, BlockPos block) {
+
+        double dx = block.getX() + 0.5 - c.player.getX();
+        double dz = block.getZ() + 0.5 - c.player.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist > 0.35) {
+            c.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+            c.options.backKey.setPressed(false);
+            c.options.forwardKey.setPressed(true);
+            c.options.jumpKey.setPressed(c.player.horizontalCollision);
+            return false;
+        }
+
+        releaseKeys(c);
+
+        double speed = c.player.getVelocity().horizontalLength();
+        return onBlock(c, block) && speed < 0.03;
+    }
+
+    private static void releaseKeys(MinecraftClient c) {
+        if (c.options != null) {
+            c.options.forwardKey.setPressed(false);
+            c.options.backKey.setPressed(false);
+            c.options.jumpKey.setPressed(false);
+        }
+    }
+
+    /** Turns the player to look at a point (yaw/pitch like vanilla). */
+    private static void aimAt(MinecraftClient c, Vec3d target) {
+        Vec3d eye = c.player.getEyePos();
+        double dx = target.x - eye.x;
+        double dy = target.y - eye.y;
+        double dz = target.z - eye.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        c.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        c.player.setPitch((float) -Math.toDegrees(Math.atan2(dy, horiz)));
+    }
+
+    /* ---------- throw aiming ---------- */
+
+    /** Works out where to look so thrown slabs land on the cobblestone block. */
+    private static void computeThrowAim(MinecraftClient c) {
+
+        double dx = dropPos.getX() + 0.5 - c.player.getX();
+        double dz = dropPos.getZ() + 0.5 - c.player.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+        double ground = dropPos.getY() - standPos.getY(); // height difference between the two blocks
+
+        throwYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        throwPitch = bestThrowPitch(dist, ground) + THROW_PITCH_TWEAK;
+
+        LOG.info("Throw aim: yaw {} pitch {} (distance {} to cobblestone)", throwYaw, throwPitch, dist);
+    }
+
+    private static float bestThrowPitch(double dist, double ground) {
+
+        float best = 0f;
+        double bestErr = Double.MAX_VALUE;
+
+        for (int p = -45; p <= 60; p++) {
+            double err = Math.abs(simulateThrow(p, ground) - dist);
+            if (err < bestErr) {
+                bestErr = err;
+                best = p;
+            }
+        }
+
+        return best;
+    }
+
+    /** Rough simulation of a dropped item (vanilla throw speed 0.3, gravity 0.04, drag 0.98, ground friction). */
+    private static double simulateThrow(float pitchDeg, double ground) {
+
+        double rad = Math.toRadians(pitchDeg);
+        double vx = 0.3 * Math.cos(rad);
+        double vy = -0.3 * Math.sin(rad) + 0.1;
+        double x = 0.0;
+        double y = 1.32; // eye height - 0.3
+
+        for (int t = 0; t < 400; t++) {
+
+            vy -= 0.04;
+            x += vx;
+            y += vy;
+
+            boolean onGround = false;
+
+            if (y <= ground) {
+                y = ground;
+                vy = 0;
+                onGround = true;
+            }
+
+            double f = onGround ? 0.588 : 0.98;
+            vx *= f;
+            vy *= 0.98;
+
+            if (onGround && vx < 0.003) {
+                break;
+            }
+        }
+
+        return x;
     }
 
     /* ======================================================== */
@@ -318,7 +491,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void orderCmd(MinecraftClient c) {
         orderStep = 0;
-        textSet = false;
         dialogScreen = null;
         orderFilled = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
@@ -373,7 +545,6 @@ public class SpruceFastClient implements ClientModInitializer {
             if (s != -1) {
                 click(c, h, s, SlotActionType.PICKUP);
                 orderStep = 2;
-                textSet = false;
                 cooldown = 0;
                 return;
             }
@@ -409,21 +580,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
         // New dialog screen -> remember when we first saw it.
         if (sc != dialogScreen) {
-            if (dialogScreen != null && lastPressTick > -500) {
-                good(G_DIALOG);      // our click on the previous screen worked
-            }
             dialogScreen = sc;
             dialogSince = tickCounter;
             lastPressTick = -1000;
         }
 
         // Let a fresh screen finish building before touching it.
-        if (tickCounter - dialogSince < tune[T_DIALOG]) {
+        if (tickCounter - dialogSince < DIALOG_SETTLE) {
             return;
         }
 
         // Pressed recently on this same screen -> wait; retry only if nothing changed.
-        if (tickCounter - lastPressTick < tune[T_RETRY]) {
+        if (tickCounter - lastPressTick < PRESS_RETRY) {
             return;
         }
 
@@ -433,7 +601,6 @@ public class SpruceFastClient implements ClientModInitializer {
         String title = sc.getTitle().getString().toLowerCase();
         TextFieldWidget tf = firstTextField(ws);
         ClickableWidget b;
-        boolean repeatedPress = lastPressTick > -500;   // same screen, we already pressed here
 
         /*
          * The action is chosen by what is ON the screen (not by a step counter),
@@ -469,10 +636,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
         } else {
             return;
-        }
-
-        if (repeatedPress) {
-            fail(c, G_DIALOG, "a dialog click had to be repeated");
         }
 
         lastPressTick = tickCounter;
@@ -584,14 +747,13 @@ public class SpruceFastClient implements ClientModInitializer {
         collectedTotal += Math.max(gained, 0);
         closeScreens(c);
         info(c, "Collected " + collectedTotal + "/" + TARGET_LOGS + " logs.");
-        tripLogs = 0;
         tableAimStage = 0;
         setPhase(Phase.TABLE_OPEN);
         cooldown = 6;
     }
 
     /* ======================================================== */
-    /*              SLABS (crafting table, Ctrl+Q drops)        */
+    /*       CRAFTING TABLE (stand on deepslate, throw slabs)   */
     /* ======================================================== */
 
     /*
@@ -603,48 +765,44 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void tableOpen(MinecraftClient c) {
 
+        // Nothing left to craft -> go sell what is in the inventory / on the ground.
         if (count(c, Items.SPRUCE_LOG) == 0 && count(c, Items.SPRUCE_PLANKS) < 3) {
             releaseKeys(c);
-            if (count(c, Items.SPRUCE_SLAB) > 0) {
-                enterPickupWait();
+            if (count(c, Items.SPRUCE_SLAB) > 0 || droppedAny) {
+                setPhase(Phase.GO_DROP);
             } else {
                 afterSell(c);
             }
             return;
         }
 
-        if (phaseTicks > 400) {
+        if (phaseTicks > 600) {
             releaseKeys(c);
-            stop(c, "Could not get to the crafting table.");
+            stop(c, "Could not get onto the deepslate block.");
             return;
         }
 
-        BlockPos pos = findCraftingTable(c);
-
-        if (pos == null) {
+        if (!c.world.getBlockState(tablePos).isOf(Blocks.CRAFTING_TABLE)) {
             releaseKeys(c);
-            stop(c, "No crafting table found within " + TABLE_SEARCH + " blocks. Place one next to you.");
+            stop(c, "The crafting table is gone.");
             return;
         }
 
-        Vec3d center = Vec3d.ofCenter(pos);
-        double dist = c.player.getEyePos().distanceTo(center);
+        if (c.currentScreen instanceof HandledScreen<?>) {
+            closeScreens(c);
+        }
 
-        // Too far (e.g. after walking out to pick up slabs): walk back toward the table first.
-        if (dist > TABLE_REACH) {
-            aimAt(c, center);
-            c.options.backKey.setPressed(false);
-            c.options.forwardKey.setPressed(true);
-            c.options.jumpKey.setPressed(c.player.horizontalCollision);
+        // 1) Walk onto the deepslate block.
+        if (!walkTo(c, standPos)) {
             tableAimStage = 0;
             return;
         }
 
-        releaseKeys(c);
+        Vec3d center = Vec3d.ofCenter(tablePos);
 
-        // Stage 0: remember the best drop direction, then LOOK at the table (servers check where we look).
+        // 2) Stage 0: work out the throw direction, then LOOK at the table (servers check where we look).
         if (tableAimStage == 0) {
-            dropYaw = bestDropYaw(c);
+            computeThrowAim(c);
             aimAt(c, center);
             tableAimStage = 1;
             cooldown = 3;
@@ -653,15 +811,15 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tableAimStage = 0;
 
-        // Stage 1: use the block exactly where the crosshair points.
+        // 3) Stage 1: use the block exactly where the crosshair points.
         Vec3d eye = c.player.getEyePos();
         Vec3d end = eye.add(c.player.getRotationVec(1.0f).multiply(5.0));
 
         BlockHitResult hit = c.world.raycast(new RaycastContext(
             eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, c.player));
 
-        if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos)) {
-            hit = new BlockHitResult(center, Direction.UP, pos, false);
+        if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(tablePos)) {
+            hit = new BlockHitResult(center, Direction.UP, tablePos, false);
         }
 
         c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
@@ -674,24 +832,13 @@ public class SpruceFastClient implements ClientModInitializer {
         setPhase(Phase.TABLE);
     }
 
-    /** Turns the player to look at a point (yaw/pitch like vanilla). */
-    private static void aimAt(MinecraftClient c, Vec3d target) {
-        Vec3d eye = c.player.getEyePos();
-        double dx = target.x - eye.x;
-        double dy = target.y - eye.y;
-        double dz = target.z - eye.z;
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        c.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-        c.player.setPitch((float) -Math.toDegrees(Math.atan2(dy, horiz)));
-    }
-
     /*
      * Everything happens inside the REAL crafting table (server-side container):
      *   logs   -> planks  (1 log stack in the grid, shift-click the result)
      *   planks -> slabs   (3 plank stacks in the bottom row, shift-click the result)
      *
      * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
-     * ONE per clickGap ticks, after a short wait when the table opens, so the server and
+     * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
      * anti-cheat see human-like inventory activity.
      */
     private static void table(MinecraftClient c) {
@@ -708,9 +855,8 @@ public class SpruceFastClient implements ClientModInitializer {
                 tableSeenSync = -1;
                 clickQueue.clear();
                 LOG.warn("Crafting table was CLOSED by the server (or another source). Reopening.");
-                fail(c, G_TABLE, "the crafting table was closed");
                 if (++tableCloses > 3) {
-                    stop(c, "The crafting table keeps closing (server/anti-cheat?). It slowed itself down; if this keeps happening, delete config/spruce_fast_tuning.properties.");
+                    stop(c, "The crafting table keeps closing (server/anti-cheat?).");
                     return;
                 }
                 info(c, "Crafting table closed - reopening...");
@@ -734,9 +880,10 @@ public class SpruceFastClient implements ClientModInitializer {
         // Fresh table screen -> give the server time before touching anything.
         if (tableSeenSync != h.syncId) {
             tableSeenSync = h.syncId;
-            tableReadyAt = tickCounter + tune[T_OPEN];
-            c.player.setYaw(dropYaw);
-            c.player.setPitch(0.0f);
+            tableReadyAt = tickCounter + OPEN_WAIT;
+            // face the cobblestone so Ctrl+Q throws land on it
+            c.player.setYaw(throwYaw);
+            c.player.setPitch(throwPitch);
             clickQueue.clear();
             dumpTable(h, "table opened");
         }
@@ -748,7 +895,7 @@ public class SpruceFastClient implements ClientModInitializer {
         // Queued clicks go out one at a time.
         if (!clickQueue.isEmpty()) {
             clickQueue.poll().run();
-            cooldown = clickQueue.isEmpty() ? tune[T_SETTLE] : tune[T_GAP];
+            cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
             return;
         }
 
@@ -757,14 +904,15 @@ public class SpruceFastClient implements ClientModInitializer {
             if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
                 c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
             }
-            cooldown = tune[T_SETTLE];
+            cooldown = SETTLE;
             return;
         }
 
         /*
-         * A) Inventory full -> Ctrl+Q (drop the WHOLE stack) on every slab stack.
+         * A) Running out of room -> Ctrl+Q (drop the WHOLE stack) on every slab stack.
+         *    They fly onto the cobblestone area.
          */
-        if (countFree(h, T_INV_FROM, T_INV_TO) == 0
+        if (countFree(h, T_INV_FROM, T_INV_TO) < 4
                 && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
 
             for (int i = T_INV_FROM; i < T_INV_TO; i++) {
@@ -795,7 +943,6 @@ public class SpruceFastClient implements ClientModInitializer {
                 // A foreign item: report it, send it back to the inventory and carry on.
                 String name = st.getName().getString() + " x" + st.getCount() + " (grid slot " + i + ")";
                 LOG.warn("Foreign item in crafting grid: {}", name);
-                fail(c, G_TABLE, "unexpected item in the crafting grid");
                 dumpTable(h, "foreign item");
 
                 if (++foreignCount > 5) {
@@ -820,11 +967,9 @@ public class SpruceFastClient implements ClientModInitializer {
                 lastGridPlanks = gridCount;      // progress
                 noProgress = 0;
                 gridReturns = 0;
-                good(G_TABLE);
             } else if (++noProgress >= 4) {
 
                 dumpTable(h, "no crafting progress");
-                fail(c, G_TABLE, "crafting made no progress");
 
                 if (++gridReturns > 3) {
                     stop(c, "Crafting makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.");
@@ -844,13 +989,12 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             click(c, h, 0, SlotActionType.QUICK_MOVE);
-            cooldown = tune[T_SETTLE];
+            cooldown = SETTLE;
             return;
         }
 
         if (lastGridPlanks != -1) {
             gridReturns = 0; // grid went empty = it was crafted
-            good(G_TABLE);
         }
 
         lastGridPlanks = -1;
@@ -859,25 +1003,31 @@ public class SpruceFastClient implements ClientModInitializer {
         /*
          * C) Grid empty -> load the next thing, or finish.
          */
+        boolean haveLogs = findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO) != -1;
+        boolean havePlanks = stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO) >= 3;
+        int freeNow = countFree(h, T_INV_FROM, T_INV_TO);
 
-        // logs first: ONE stack in the top-left cell
-        if (findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO) != -1) {
+        // logs first (ONE stack in the top-left cell) - unless the inventory is getting full
+        // of planks, then turn planks into slabs (and throw them) to make room first.
+        if (haveLogs && (freeNow >= 5 || !havePlanks)) {
             queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});
             return;
         }
 
-        // then planks: three stacks side by side in the bottom row
-        if (stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO) < 3) {
-            c.player.closeHandledScreen();
-            info(c, "Crafting finished. Picking up and selling...");
-            enterPickupWait();
+        // planks: three stacks side by side in the bottom row
+        if (havePlanks) {
+            queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});
             return;
         }
 
-        queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});
+        // nothing left to craft -> walk to the cobblestone and sell
+        c.player.closeHandledScreen();
+        info(c, "Crafting finished. Walking to the cobblestone to sell...");
+        setPhase(Phase.GO_DROP);
+        cooldown = 3;
     }
 
-    /** Queues one click; it is sent later, one per clickGap ticks. */
+    /** Queues one click; it is sent later, one per CLICK_GAP ticks. */
     private static void q(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
         clickQueue.add(() -> {
             if (c.player != null && c.player.currentScreenHandler == h) {
@@ -949,156 +1099,51 @@ public class SpruceFastClient implements ClientModInitializer {
         }
     }
 
-    private static BlockPos findCraftingTable(MinecraftClient c) {
-
-        BlockPos base = c.player.getBlockPos();
-        Vec3d eye = c.player.getEyePos();
-
-        BlockPos best = null;
-        double bestD = Double.MAX_VALUE;
-
-        for (int dx = -TABLE_SEARCH; dx <= TABLE_SEARCH; dx++) {
-            for (int dy = -4; dy <= 4; dy++) {
-                for (int dz = -TABLE_SEARCH; dz <= TABLE_SEARCH; dz++) {
-
-                    BlockPos p = base.add(dx, dy, dz);
-
-                    if (!c.world.getBlockState(p).isOf(Blocks.CRAFTING_TABLE)) {
-                        continue;
-                    }
-
-                    double d = eye.squaredDistanceTo(Vec3d.ofCenter(p));
-
-                    if (d < bestD) {
-                        bestD = d;
-                        best = p;
-                    }
-                }
-            }
-        }
-
-        return best;
-    }
-
     /* ======================================================== */
-    /*                  PICK UP + SELL (one shot)               */
+    /*             COBBLESTONE: PICK UP + SELL (loop)           */
     /* ======================================================== */
 
-    private static void enterPickupWait() {
-        pickupLastCount = -1;
-        pickupStable = 0;
-        setPhase(droppedAny ? Phase.PICKUP_WALK : Phase.PICKUP_WAIT);
-    }
-
-    /*
-     * Walk out over the dropped slabs and back again (the inventory picks them up on the way).
-     */
-    private static void pickupWalk(MinecraftClient c) {
+    /** Walks onto the cobblestone block (and stays there until everything is sold). */
+    private static void goDrop(MinecraftClient c) {
 
         if (c.currentScreen instanceof HandledScreen<?>) {
             closeScreens(c);
         }
 
-        if (phaseTicks == 1) {
-            c.player.setYaw(dropYaw);
-            c.player.setPitch(0.0f);
-        }
-
-        if (phaseTicks <= 4) {
-            return; // let the rotation reach the server first
-        }
-
-        int t = phaseTicks - 4;
-
-        if (t <= WALK_TICKS) {
-            c.options.backKey.setPressed(false);
-            c.options.forwardKey.setPressed(true);
+        if (phaseTicks > 600) {
+            releaseKeys(c);
+            stop(c, "Could not get onto the cobblestone block.");
             return;
         }
 
-        if (t <= 2 * WALK_TICKS) {
-            c.options.forwardKey.setPressed(false);
-            c.options.backKey.setPressed(true);
+        if (!walkTo(c, dropPos)) {
             return;
         }
 
-        releaseKeys(c);
-
-        if (t < 2 * WALK_TICKS + 10) {
-            return; // let the last items be picked up
-        }
-
-        if (count(c, Items.SPRUCE_SLAB) == 0) {
-            droppedAny = false; // nothing left on the ground
-            afterSell(c);
-        } else {
-            pickupLastCount = -1;
-            pickupStable = 0;
-            setPhase(Phase.PICKUP_WAIT);
-        }
+        enterPickupWait();
     }
 
-    private static void releaseKeys(MinecraftClient c) {
-        if (c.options != null) {
-            c.options.forwardKey.setPressed(false);
-            c.options.backKey.setPressed(false);
-            c.options.jumpKey.setPressed(false);
-        }
-    }
-
-    /** Picks the horizontal direction with the most free, floored blocks ahead (up to 5). */
-    private static float bestDropYaw(MinecraftClient c) {
-
-        BlockPos feet = c.player.getBlockPos();
-        float base = Math.round(c.player.getYaw() / 90.0f) * 90.0f;
-
-        float best = base;
-        int bestScore = -1;
-
-        for (int k = 0; k < 4; k++) {
-
-            float yaw = base + 90.0f * k;
-            double rad = Math.toRadians(yaw);
-            int dx = (int) Math.round(-Math.sin(rad));
-            int dz = (int) Math.round(Math.cos(rad));
-
-            int score = 0;
-
-            for (int step = 1; step <= 5; step++) {
-
-                BlockPos f = feet.add(dx * step, 0, dz * step);
-                BlockPos hd = f.up();
-                BlockPos fl = f.down();
-
-                boolean clear = c.world.getBlockState(f).getCollisionShape(c.world, f).isEmpty()
-                        && c.world.getBlockState(hd).getCollisionShape(c.world, hd).isEmpty();
-                boolean floor = !c.world.getBlockState(fl).getCollisionShape(c.world, fl).isEmpty();
-
-                if (!clear || !floor) {
-                    break;
-                }
-
-                score++;
-            }
-
-            if (score > bestScore) {
-                bestScore = score;
-                best = yaw;
-            }
-        }
-
-        return best;
+    private static void enterPickupWait() {
+        pickupLastCount = -1;
+        pickupStable = 0;
+        setPhase(Phase.PICKUP_WAIT);
     }
 
     /*
-     * Dropped slabs lie at our feet and are picked up again automatically as soon as
-     * the inventory has room. Sell whatever is in the inventory once it stops growing,
-     * then repeat until nothing more shows up.
+     * Standing on the cobblestone, thrown slabs are picked up automatically as soon as the
+     * inventory has room. Sell whatever is in the inventory once it stops growing, then repeat
+     * until nothing more shows up.
      */
     private static void pickupWait(MinecraftClient c) {
 
         if (c.currentScreen instanceof HandledScreen<?>) {
             closeScreens(c);
+        }
+
+        // pushed off the cobblestone? walk back onto it
+        if (!onBlock(c, dropPos)) {
+            setPhase(Phase.GO_DROP);
+            return;
         }
 
         int slabs = count(c, Items.SPRUCE_SLAB);
@@ -1121,6 +1166,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         if (phaseTicks > 100) { // nothing left on the ground
+            droppedAny = false;
             afterSell(c);
         }
     }
@@ -1183,19 +1229,18 @@ public class SpruceFastClient implements ClientModInitializer {
         enterPickupWait();
     }
 
+    /** Nothing more to sell: craft the logs that are left, start the next order, or finish. */
     private static void afterSell(MinecraftClient c) {
 
-        sellAttempts = 0;
         cooldown = 10;
 
         if (count(c, Items.SPRUCE_LOG) > 0) {
-            setPhase(Phase.TABLE_OPEN);
+            tableAimStage = 0;
+            setPhase(Phase.TABLE_OPEN);   // walks back onto the deepslate block
             return;
         }
 
         if (collectedTotal >= TARGET_LOGS) {
-
-            endCycle(c);
 
             if (!LOOP) {
                 stop(c, "Done.");
@@ -1215,152 +1260,6 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         setPhase(Phase.ORDER_WAIT);
-    }
-
-    /* ======================================================== */
-    /*                      SELF-LEARNING                       */
-    /* ======================================================== */
-
-    /** Something went wrong: slow this group down and remember the value that failed. */
-    private static void fail(MinecraftClient c, int group, String why) {
-
-        cycleFailures++;
-
-        if (!LEARNING) {
-            return;
-        }
-
-        goodStreak[group] = 0;
-
-        for (int p : GROUP[group]) {
-            int v = tune[p];
-            learnedFloor[p] = Math.min(T_MAX[p], Math.max(learnedFloor[p], v + 1));
-            tune[p] = Math.min(T_MAX[p], v + Math.max(1, v / 2));
-        }
-
-        LOG.info("[LEARN] {} -> slowing down: {}", why, tuneString());
-        saveTuning();
-    }
-
-    /** Something worked cleanly: after enough of these, shrink this group's delays by one tick. */
-    private static void good(int group) {
-
-        if (!LEARNING) {
-            return;
-        }
-
-        if (++goodStreak[group] < GOOD_NEEDED[group]) {
-            return;
-        }
-
-        goodStreak[group] = 0;
-
-        boolean changed = false;
-
-        for (int p : GROUP[group]) {
-            if (tune[p] > learnedFloor[p]) {
-                tune[p]--;
-                changed = true;
-            }
-        }
-
-        if (changed) {
-            LOG.info("[LEARN] speeding up: {}", tuneString());
-            saveTuning();
-        }
-    }
-
-    /** A whole order -> craft -> sell cycle is finished: report speed, re-allow probing of old limits. */
-    private static void endCycle(MinecraftClient c) {
-
-        int ticks = tickCounter - cycleStartTick;
-
-        if (cycleFailures == 0) {
-            cleanCycles++;
-            // every 3 clean cycles, forget one step of the "this failed before" memory so it can probe again
-            if (LEARNING && cleanCycles % 3 == 0) {
-                for (int p = 0; p < learnedFloor.length; p++) {
-                    learnedFloor[p] = Math.max(T_MIN[p], learnedFloor[p] - 1);
-                }
-            }
-        } else {
-            cleanCycles = 0;
-        }
-
-        boolean best = ticks < bestCycleTicks;
-        if (best) {
-            bestCycleTicks = ticks;
-        }
-
-        String msg = "Cycle took " + (ticks / 20) + "s" + (best ? " (new best!)" : " (best " + (bestCycleTicks / 20) + "s)")
-            + ", problems: " + cycleFailures + ", timing: " + tuneString();
-
-        LOG.info("[LEARN] {}", msg);
-
-        if (c.player != null) {
-            c.player.sendMessage(Text.literal("Spruce Fast: " + msg), false);
-        }
-
-        cycleStartTick = tickCounter;
-        cycleFailures = 0;
-        saveTuning();
-    }
-
-    private static String tuneString() {
-        StringBuilder sb = new StringBuilder();
-        for (int p = 0; p < tune.length; p++) {
-            if (p > 0) sb.append(' ');
-            sb.append(T_NAME[p]).append('=').append(tune[p]);
-        }
-        return sb.toString();
-    }
-
-    private static Path tuningFile() {
-        return FabricLoader.getInstance().getConfigDir().resolve("spruce_fast_tuning.properties");
-    }
-
-    private static int clamp(int v, int lo, int hi) {
-        return Math.max(lo, Math.min(hi, v));
-    }
-
-    private static void loadTuning() {
-        if (!LEARNING) {
-            return;
-        }
-        try {
-            Path f = tuningFile();
-            if (!Files.exists(f)) {
-                return;
-            }
-            Properties pr = new Properties();
-            try (var in = Files.newInputStream(f)) {
-                pr.load(in);
-            }
-            for (int p = 0; p < tune.length; p++) {
-                tune[p] = clamp(Integer.parseInt(pr.getProperty(T_NAME[p], String.valueOf(tune[p]))), T_MIN[p], T_MAX[p]);
-                learnedFloor[p] = clamp(Integer.parseInt(pr.getProperty(T_NAME[p] + ".floor", String.valueOf(learnedFloor[p]))), T_MIN[p], T_MAX[p]);
-            }
-            bestCycleTicks = Integer.parseInt(pr.getProperty("bestCycleTicks", String.valueOf(bestCycleTicks)));
-            LOG.info("[LEARN] loaded saved timing: {}", tuneString());
-        } catch (Exception e) {
-            LOG.warn("[LEARN] could not read saved timing: {}", e.toString());
-        }
-    }
-
-    private static void saveTuning() {
-        try {
-            Properties pr = new Properties();
-            for (int p = 0; p < tune.length; p++) {
-                pr.setProperty(T_NAME[p], String.valueOf(tune[p]));
-                pr.setProperty(T_NAME[p] + ".floor", String.valueOf(learnedFloor[p]));
-            }
-            pr.setProperty("bestCycleTicks", String.valueOf(bestCycleTicks));
-            try (var out = Files.newOutputStream(tuningFile())) {
-                pr.store(out, "Spruce Fast learned timing (delete to reset)");
-            }
-        } catch (Exception e) {
-            LOG.warn("[LEARN] could not save timing: {}", e.toString());
-        }
     }
 
     /* ======================================================== */
@@ -1457,18 +1356,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return any;
     }
 
-    /** Shift-clicks up to 6 matching slots in [from, to). Returns true if anything was clicked. */
-    private static boolean quickMoveAll(MinecraftClient c, ScreenHandler h, int from, int to, Item item) {
-        int done = 0;
-        for (int i = from; i < to && done < 6; i++) {
-            if (h.getSlot(i).getStack().isOf(item)) {
-                click(c, h, i, SlotActionType.QUICK_MOVE);
-                done++;
-            }
-        }
-        return done > 0;
-    }
-
     /** Logs a GUI once so we can see exact titles and button names. */
     private static void dump(HandledScreen<?> hs) {
         if (hs == lastScreen) {
@@ -1546,21 +1433,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return null;
     }
 
-    /** Types the text and presses the button in the same tick. */
-    private static boolean typeAndPress(MinecraftClient c, List<ClickableWidget> ws, String text, String label) {
-
-        TextFieldWidget tf = firstTextField(ws);
-        ClickableWidget b = button(ws, label);
-
-        if (tf == null || b == null) {
-            return false;
-        }
-
-        tf.setText(text);
-        pressButton(b);
-        return true;
-    }
-
     /*
      * Simulates a left click in the middle of the widget.
      * This is the only version-sensitive call (written for Minecraft 1.21.9+).
@@ -1609,15 +1481,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return n;
     }
 
-    private static int biggestStack(ScreenHandler h, Item item, int from, int to) {
-        int best = 0;
-        for (int i = from; i < to; i++) {
-            ItemStack st = h.getSlot(i).getStack();
-            if (st.isOf(item) && st.getCount() > best) best = st.getCount();
-        }
-        return best;
-    }
-
     private static int findIn(ScreenHandler h, Item item, int from, int to) {
         for (int i = from; i < to; i++) {
             if (h.getSlot(i).getStack().isOf(item)) return i;
@@ -1658,37 +1521,5 @@ public class SpruceFastClient implements ClientModInitializer {
             if (h.getSlot(i).getStack().isEmpty()) n++;
         }
         return n;
-    }
-
-    private static int findSlotWith(PlayerScreenHandler h, Item item) {
-        for (int i = 9; i <= 45; i++) {
-            if (h.getSlot(i).getStack().isOf(item)) return i;
-        }
-        return -1;
-    }
-
-    private static boolean gridHasItems(PlayerScreenHandler h) {
-        for (int i = 1; i <= 4; i++) {
-            if (!h.getSlot(i).getStack().isEmpty()) return true;
-        }
-        return false;
-    }
-
-    private static boolean gridOnlyLogs(PlayerScreenHandler h) {
-        for (int i = 1; i <= 4; i++) {
-            ItemStack s = h.getSlot(i).getStack();
-            if (!s.isEmpty() && !s.isOf(Items.SPRUCE_LOG)) return false;
-        }
-        return true;
-    }
-
-    private static boolean clearCursor(MinecraftClient c, PlayerScreenHandler h) {
-        for (int s = 9; s <= 44; s++) {
-            if (h.getSlot(s).getStack().isEmpty()) {
-                click(c, h, s, SlotActionType.PICKUP);
-                return true;
-            }
-        }
-        return false;
     }
 }
