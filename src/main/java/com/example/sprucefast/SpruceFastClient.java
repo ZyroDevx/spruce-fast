@@ -24,19 +24,12 @@ public class SpruceFastClient implements ClientModInitializer {
     private static KeyBinding startKey;
 
     private static boolean enabled = false;
+    private static boolean waitingForInventory = false;
 
     /*
-     * Crafting speed.
-     *
-     * 20 result clicks per tick.
+     * How many crafting results we try to process per tick.
      */
     private static final int CRAFTS_PER_TICK = 20;
-
-    /*
-     * We need to wait for Minecraft's normal
-     * inventory key handling after simulating E.
-     */
-    private static boolean waitingForInventory = false;
 
     @Override
     public void onInitializeClient() {
@@ -55,7 +48,7 @@ public class SpruceFastClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
 
             /*
-             * BACKSPACE = toggle Spruce Fast
+             * BACKSPACE
              */
             while (startKey.wasPressed()) {
 
@@ -70,10 +63,7 @@ public class SpruceFastClient implements ClientModInitializer {
                     waitingForInventory = true;
 
                     /*
-                     * ACTUALLY SIMULATE PRESSING E.
-                     *
-                     * This sends the E key into Minecraft's
-                     * normal KeyBinding system.
+                     * Trigger Minecraft's inventory key.
                      */
                     KeyBinding.onKeyPressed(
                         InputUtil.Type.KEYSYM.createFromCode(
@@ -82,9 +72,7 @@ public class SpruceFastClient implements ClientModInitializer {
                     );
 
                     client.player.sendMessage(
-                        Text.literal(
-                            "Spruce Fast: ON"
-                        ),
+                        Text.literal("Spruce Fast: ON"),
                         true
                     );
 
@@ -93,9 +81,7 @@ public class SpruceFastClient implements ClientModInitializer {
                     waitingForInventory = false;
 
                     client.player.sendMessage(
-                        Text.literal(
-                            "Spruce Fast: OFF"
-                        ),
+                        Text.literal("Spruce Fast: OFF"),
                         true
                     );
                 }
@@ -111,8 +97,7 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             /*
-             * Wait until Minecraft has processed the
-             * simulated E and opened the inventory.
+             * Wait for the inventory to open.
              */
             if (waitingForInventory) {
 
@@ -125,22 +110,14 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
-            /*
-             * Now the inventory is open.
-             */
             run(client);
         });
     }
 
     private static void run(MinecraftClient client) {
 
-        /*
-         * We specifically need the player's inventory
-         * screen handler.
-         */
         if (!(client.player.currentScreenHandler
                 instanceof PlayerScreenHandler)) {
-
             return;
         }
 
@@ -149,19 +126,17 @@ public class SpruceFastClient implements ClientModInitializer {
                 client.player.currentScreenHandler;
 
         /*
-         * Don't interfere with anything currently
-         * held by the mouse cursor.
+         * Don't do anything while holding an item
+         * with the mouse cursor.
          */
         if (!handler.getCursorStack().isEmpty()) {
             return;
         }
 
         /*
-         * ------------------------------------------------
-         * STEP 1:
-         * If there are logs already in the 2x2 crafting
-         * grid, take the plank results.
-         * ------------------------------------------------
+         * -----------------------------------------
+         * CRAFTING GRID ALREADY HAS LOGS
+         * -----------------------------------------
          */
         if (hasCraftingInput(handler)) {
 
@@ -179,19 +154,21 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
+            /*
+             * Take the crafting results and put them
+             * DIRECTLY INTO THE HOTBAR.
+             */
             takeCraftingResults(client, handler);
 
             return;
         }
 
         /*
-         * ------------------------------------------------
-         * STEP 2:
-         * Crafting grid is empty.
-         *
-         * Find a spruce log stack.
-         * ------------------------------------------------
+         * -----------------------------------------
+         * CRAFTING GRID IS EMPTY
+         * -----------------------------------------
          */
+
         int logSlot = findLogInventorySlot(client);
 
         if (logSlot == -1) {
@@ -209,10 +186,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * ------------------------------------------------
-         * STEP 3:
-         * Pick up the ENTIRE spruce log stack.
-         * ------------------------------------------------
+         * Pick up the ENTIRE spruce-log stack.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -223,18 +197,7 @@ public class SpruceFastClient implements ClientModInitializer {
         );
 
         /*
-         * ------------------------------------------------
-         * STEP 4:
-         * Put the ENTIRE stack into crafting slot #1.
-         *
-         * PlayerScreenHandler:
-         *
-         * 0 = crafting result
-         * 1 = crafting input
-         * 2 = crafting input
-         * 3 = crafting input
-         * 4 = crafting input
-         * ------------------------------------------------
+         * Put the entire stack into crafting slot 1.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -260,8 +223,8 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /*
-     * Check whether the 2x2 crafting grid contains
-     * anything.
+     * Checks whether anything is inside
+     * the 2x2 crafting grid.
      */
     private static boolean hasCraftingInput(
             PlayerScreenHandler handler) {
@@ -277,7 +240,7 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /*
-     * Make sure the crafting grid contains only
+     * Makes sure the crafting grid only contains
      * spruce logs.
      */
     private static boolean onlySpruceLogsInCraftingGrid(
@@ -300,12 +263,8 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /*
-     * Take the crafting result extremely quickly.
-     *
-     * 1 spruce log = 4 spruce planks.
-     *
-     * The whole log stack stays inside the crafting
-     * slot while the result is repeatedly taken.
+     * Takes the crafting result and places it
+     * DIRECTLY INTO THE HOTBAR.
      */
     private static void takeCraftingResults(
             MinecraftClient client,
@@ -317,7 +276,7 @@ public class SpruceFastClient implements ClientModInitializer {
                 handler.getOutputSlot().getStack();
 
             /*
-             * Nothing to craft.
+             * No crafting result.
              */
             if (result.isEmpty()) {
                 break;
@@ -331,20 +290,127 @@ public class SpruceFastClient implements ClientModInitializer {
             }
 
             /*
-             * Shift-click the result into inventory.
+             * Find a hotbar slot that can accept
+             * the 4 spruce planks.
+             */
+            int hotbarSlot =
+                findHotbarSlotForPlanks(client);
+
+            /*
+             * Hotbar is completely full.
+             */
+            if (hotbarSlot == -1) {
+
+                enabled = false;
+
+                client.player.sendMessage(
+                    Text.literal(
+                        "Spruce Fast: Hotbar is full. Make space for spruce planks."
+                    ),
+                    true
+                );
+
+                return;
+            }
+
+            /*
+             * PICK UP the 4 planks from the crafting
+             * result instead of QUICK_MOVE.
              */
             client.interactionManager.clickSlot(
                 handler.syncId,
                 0,
                 0,
-                SlotActionType.QUICK_MOVE,
+                SlotActionType.PICKUP,
                 client.player
             );
+
+            /*
+             * Put those planks directly into the
+             * selected hotbar slot.
+             */
+            client.interactionManager.clickSlot(
+                handler.syncId,
+                hotbarSlot,
+                0,
+                SlotActionType.PICKUP,
+                client.player
+            );
+
+            /*
+             * If Minecraft couldn't fit everything,
+             * don't continue and potentially lose items.
+             */
+            if (!handler.getCursorStack().isEmpty()) {
+
+                /*
+                 * Put the remaining items back into
+                 * the result slot.
+                 */
+                client.interactionManager.clickSlot(
+                    handler.syncId,
+                    0,
+                    0,
+                    SlotActionType.PICKUP,
+                    client.player
+                );
+
+                break;
+            }
         }
     }
 
     /*
-     * Find a spruce log stack.
+     * Find a hotbar slot for spruce planks.
+     *
+     * Priority:
+     *
+     * 1. Existing spruce plank stack with >= 4 space
+     * 2. Empty hotbar slot
+     */
+    private static int findHotbarSlotForPlanks(
+            MinecraftClient client) {
+
+        var stacks =
+            client.player
+                .getInventory()
+                .getMainStacks();
+
+        /*
+         * First look for an existing spruce-plank stack
+         * that can fit the full 4-plank result.
+         */
+        for (int i = 0; i < 9; i++) {
+
+            ItemStack stack = stacks.get(i);
+
+            if (stack.isOf(Items.SPRUCE_PLANKS)
+                && stack.getCount() <= 60) {
+
+                /*
+                 * Screen hotbar slots are 36-44.
+                 */
+                return 36 + i;
+            }
+        }
+
+        /*
+         * Otherwise find an empty hotbar slot.
+         */
+        for (int i = 0; i < 9; i++) {
+
+            ItemStack stack = stacks.get(i);
+
+            if (stack.isEmpty()) {
+                return 36 + i;
+            }
+        }
+
+        return -1;
+    }
+
+    /*
+     * Finds a spruce-log stack in the inventory.
      */
     private static int findLogInventorySlot(
             MinecraftClient client) {
@@ -364,7 +430,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
             /*
              * Hotbar inventory indexes 0-8
-             * correspond to screen slots 36-44.
+             * = screen slots 36-44.
              */
             if (i < 9) {
                 return 36 + i;
@@ -372,13 +438,13 @@ public class SpruceFastClient implements ClientModInitializer {
 
             /*
              * Main inventory indexes 9-35
-             * correspond to screen slots 9-35.
+             * = screen slots 9-35.
              */
             return i;
         }
 
         /*
-         * Offhand.
+         * Check offhand.
          */
         ItemStack offhand =
             client.player.getOffHandStack();
