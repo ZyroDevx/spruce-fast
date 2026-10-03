@@ -25,16 +25,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static boolean enabled = false;
 
-    /*
-     * How many crafting-result clicks to send
-     * each client tick.
-     *
-     * Higher = faster, but servers can reject
-     * excessive inventory packets.
-     */
+    // How many crafting-result clicks to attempt per tick
     private static final int CRAFTS_PER_TICK = 8;
-
-    private static int timer = 0;
 
     @Override
     public void onInitializeClient() {
@@ -52,17 +44,16 @@ public class SpruceFastClient implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
 
+            // Toggle with Backspace
             while (startKey.wasPressed()) {
 
                 enabled = !enabled;
-                timer = 0;
 
                 if (client.player != null) {
-
                     client.player.sendMessage(
                         Text.literal(
-                            "Spruce Fast: "
-                                + (enabled ? "ON" : "OFF")
+                            "Spruce Fast: " +
+                            (enabled ? "ON" : "OFF")
                         ),
                         true
                     );
@@ -78,79 +69,60 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
-            timer++;
-
-            if (timer < 1) {
-                return;
-            }
-
-            timer = 0;
-
             run(client);
         });
     }
 
     private static void run(MinecraftClient client) {
 
+        // Must have the normal player inventory screen handler
         if (!(client.player.currentScreenHandler
                 instanceof PlayerScreenHandler)) {
-
             return;
         }
 
         PlayerScreenHandler handler =
-            (PlayerScreenHandler)
-                client.player.currentScreenHandler;
+            (PlayerScreenHandler) client.player.currentScreenHandler;
 
-        /*
-         * Don't do anything if the cursor is holding
-         * an item.
-         */
+        // Don't interfere if the mouse cursor is holding something
         if (!handler.getCursorStack().isEmpty()) {
             return;
         }
 
         /*
-         * Make sure the 2x2 crafting grid is empty
-         * before starting.
-         *
-         * We don't want to destroy items the player
-         * manually placed in the crafting grid.
+         * FIRST:
+         * If there is something in the 2x2 crafting grid,
+         * check if it is a spruce log.
          */
-        if (!craftingGridIsEmpty(handler)) {
+        if (hasCraftingInput(handler)) {
 
-            enabled = false;
+            // Only allow spruce logs in the crafting grid
+            if (!onlySpruceLogsInCraftingGrid(handler)) {
 
-            client.player.sendMessage(
-                Text.literal(
-                    "Spruce Fast: Empty the inventory crafting grid first."
-                ),
-                true
-            );
+                enabled = false;
 
-            return;
-        }
+                client.player.sendMessage(
+                    Text.literal(
+                        "Spruce Fast: Remove other items from the inventory crafting grid."
+                    ),
+                    true
+                );
 
-        /*
-         * If there is already a spruce log in the
-         * crafting grid, don't put another stack in.
-         *
-         * This normally happens between clicks while
-         * the server is processing the recipe.
-         */
-        if (hasSpruceLogInCraftingGrid(handler)) {
+                return;
+            }
 
+            // Take the spruce plank results
             takeCraftingResults(client, handler);
 
             return;
         }
 
         /*
-         * Find a spruce-log stack in the player's
-         * inventory.
+         * SECOND:
+         * Crafting grid is empty, so find a spruce log stack
+         * in the player's inventory.
          */
-        int logSlot =
-            findLogInventorySlot(client);
+        int logSlot = findLogInventorySlot(client);
 
         if (logSlot == -1) {
 
@@ -167,13 +139,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * Put the ENTIRE spruce-log stack into
-         * the first inventory crafting slot.
-         *
-         * PlayerScreenHandler:
-         *
-         * 0 = crafting result
-         * 1-4 = 2x2 crafting input
+         * Pick up the ENTIRE spruce log stack.
          */
         client.interactionManager.clickSlot(
             handler.syncId,
@@ -183,6 +149,14 @@ public class SpruceFastClient implements ClientModInitializer {
             client.player
         );
 
+        /*
+         * Put the ENTIRE stack into the first
+         * inventory crafting slot.
+         *
+         * PlayerScreenHandler:
+         * 0 = result
+         * 1-4 = 2x2 crafting grid
+         */
         client.interactionManager.clickSlot(
             handler.syncId,
             1,
@@ -192,12 +166,9 @@ public class SpruceFastClient implements ClientModInitializer {
         );
 
         /*
-         * If anything remains on the cursor,
-         * put it back into the original inventory slot.
-         *
-         * Normally there shouldn't be anything left,
-         * because the whole stack fits into the
-         * crafting slot.
+         * If something went wrong and there is still
+         * something on the cursor, return it to the
+         * original inventory slot.
          */
         if (!handler.getCursorStack().isEmpty()) {
 
@@ -209,41 +180,76 @@ public class SpruceFastClient implements ClientModInitializer {
                 client.player
             );
         }
-
-        /*
-         * Immediately process crafting.
-         */
-        takeCraftingResults(client, handler);
     }
 
+    /*
+     * Checks whether there is anything in the 2x2 crafting grid.
+     */
+    private static boolean hasCraftingInput(
+            PlayerScreenHandler handler) {
+
+        for (var slot : handler.getInputSlots()) {
+
+            if (!slot.getStack().isEmpty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /*
+     * Makes sure the crafting grid contains ONLY spruce logs.
+     */
+    private static boolean onlySpruceLogsInCraftingGrid(
+            PlayerScreenHandler handler) {
+
+        for (var slot : handler.getInputSlots()) {
+
+            ItemStack stack = slot.getStack();
+
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            if (!stack.isOf(Items.SPRUCE_LOG)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /*
+     * Takes the spruce plank result repeatedly.
+     *
+     * One spruce log -> 4 spruce planks.
+     *
+     * The entire log stack stays in the crafting slot.
+     * We repeatedly take the result until the logs are gone.
+     */
     private static void takeCraftingResults(
             MinecraftClient client,
             PlayerScreenHandler handler) {
 
-        /*
-         * The result slot is slot 0.
-         *
-         * Each successful crafting-result pickup
-         * consumes ONE spruce log and gives
-         * FOUR spruce planks.
-         *
-         * The whole log stack can remain in the
-         * crafting input while we repeatedly
-         * take the result.
-         */
         for (int i = 0; i < CRAFTS_PER_TICK; i++) {
 
             ItemStack result =
                 handler.getOutputSlot().getStack();
 
+            // Nothing to craft
             if (result.isEmpty()) {
                 break;
             }
 
+            // Safety check
             if (!result.isOf(Items.SPRUCE_PLANKS)) {
                 break;
             }
 
+            /*
+             * QUICK_MOVE the result into the inventory.
+             */
             client.interactionManager.clickSlot(
                 handler.syncId,
                 0,
@@ -254,32 +260,9 @@ public class SpruceFastClient implements ClientModInitializer {
         }
     }
 
-    private static boolean craftingGridIsEmpty(
-            PlayerScreenHandler handler) {
-
-        for (var slot : handler.getInputSlots()) {
-
-            if (!slot.getStack().isEmpty()) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static boolean hasSpruceLogInCraftingGrid(
-            PlayerScreenHandler handler) {
-
-        for (var slot : handler.getInputSlots()) {
-
-            if (slot.getStack().isOf(Items.SPRUCE_LOG)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
+    /*
+     * Finds a spruce log stack in the player's inventory.
+     */
     private static int findLogInventorySlot(
             MinecraftClient client) {
 
@@ -288,25 +271,6 @@ public class SpruceFastClient implements ClientModInitializer {
                 .getInventory()
                 .getMainStacks();
 
-        /*
-         * PlayerScreenHandler slot layout:
-         *
-         * 0      = crafting result
-         * 1-4    = 2x2 crafting grid
-         * 5-8    = armor
-         * 9-35   = main inventory
-         * 36-44  = hotbar
-         * 45     = offhand
-         */
-
-        /*
-         * Search main inventory + hotbar.
-         *
-         * PlayerInventory indexes:
-         *
-         * 0-8   = hotbar
-         * 9-35  = main inventory
-         */
         for (int i = 0; i < stacks.size(); i++) {
 
             ItemStack stack = stacks.get(i);
@@ -315,22 +279,21 @@ public class SpruceFastClient implements ClientModInitializer {
                 continue;
             }
 
+            /*
+             * PlayerScreenHandler slot mapping:
+             *
+             * Inventory main slots 0-26 -> screen slots 9-35
+             * Hotbar slots 0-8 -> screen slots 36-44
+             */
             if (i < 9) {
-
-                // Hotbar inventory index 0-8
-                // -> handler slot 36-44
                 return 36 + i;
-
             } else {
-
-                // Main inventory index 9-35
-                // -> handler slot 9-35
                 return i;
             }
         }
 
         /*
-         * Check offhand separately.
+         * Offhand screen slot
          */
         ItemStack offhand =
             client.player.getOffHandStack();
