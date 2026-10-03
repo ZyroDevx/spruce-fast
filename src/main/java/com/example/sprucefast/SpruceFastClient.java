@@ -96,6 +96,9 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int orderStep = 0;
     private static boolean textSet = false;
     private static boolean movedAny = false;
+    private static Object dialogScreen = null;
+    private static int dialogSince = 0;
+    private static int lastPressTick = -1000;
     private static Object lastWidgetScreen = null;
     private static boolean yourOrdersClicked = false;
     private static boolean movedPlanks = false;
@@ -239,6 +242,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void orderCmd(MinecraftClient c) {
         orderStep = 0;
         textSet = false;
+        dialogScreen = null;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.ORDER_GUI);
         cooldown = 0;
@@ -305,57 +309,9 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        /* ---------- steps 2-6: dialog screens ---------- */
-        if (hs != null || c.currentScreen == null) {
-            return; // old chest still closing, or dialog not open yet
-        }
-
-        List<ClickableWidget> ws = widgets(c.currentScreen);
-        dumpWidgets(c.currentScreen, ws);
-
-        switch (orderStep) {
-
-            case 2 -> {
-                if (typeAndPress(c, ws, ORDER_ITEM_NAME, "search")) {
-                    orderStep = 3;
-                    cooldown = 0; // let the results load
-                }
-            }
-
-            case 3 -> {
-                ClickableWidget item = spruceLogButton(ws);
-                if (item != null) {
-                    pressButton(item);
-                    orderStep = 4;
-                    textSet = false;
-                    cooldown = 0;
-                }
-            }
-
-            case 4 -> {
-                if (typeAndPress(c, ws, String.valueOf(TARGET_LOGS), "next")) {
-                    orderStep = 5;
-                    cooldown = 0;
-                }
-            }
-
-            case 5 -> {
-                if (typeAndPress(c, ws, String.valueOf(PRICE_PER_LOG), "review order")) {
-                    orderStep = 6;
-                    cooldown = 0;
-                }
-            }
-
-            case 6 -> {
-                ClickableWidget create = button(ws, "create order");
-                if (create != null) {
-                    pressButton(create);
-                    orderStep = 7;
-                    cooldown = 0;
-                }
-            }
-
-            case 7 -> {
+        /* ---------- step 7: "Create Order" was pressed ---------- */
+        if (orderStep == 7) {
+            if (tickCounter - lastPressTick >= 6) {
                 closeScreens(c);
                 if (c.currentScreen != null) {
                     c.setScreen(null);
@@ -363,9 +319,77 @@ public class SpruceFastClient implements ClientModInitializer {
                 info(c, "Order created. Waiting for it to fill...");
                 setPhase(Phase.ORDER_WAIT);
             }
-
-            default -> { }
+            return;
         }
+
+        /* ---------- steps 2-6: dialog screens ---------- */
+        if (hs != null || c.currentScreen == null) {
+            return; // old chest still closing, or dialog not open yet
+        }
+
+        Screen sc = c.currentScreen;
+
+        // New dialog screen -> remember when we first saw it.
+        if (sc != dialogScreen) {
+            dialogScreen = sc;
+            dialogSince = tickCounter;
+            lastPressTick = -1000;
+        }
+
+        // Let a fresh screen finish building before touching it.
+        if (tickCounter - dialogSince < 2) {
+            return;
+        }
+
+        // Pressed recently on this same screen -> wait; retry only if nothing changed.
+        if (tickCounter - lastPressTick < 15) {
+            return;
+        }
+
+        List<ClickableWidget> ws = widgets(sc);
+        dumpWidgets(sc, ws);
+
+        String title = sc.getTitle().getString().toLowerCase();
+        TextFieldWidget tf = firstTextField(ws);
+        ClickableWidget b;
+
+        /*
+         * The action is chosen by what is ON the screen (not by a step counter),
+         * so a lost click is simply retried and a slow server can't desync us.
+         */
+        if ((b = button(ws, "create order")) != null) {
+
+            pressButton(b);
+            orderStep = 7;
+
+        } else if (tf != null && (b = button(ws, "review order")) != null) {
+
+            tf.setText(String.valueOf(PRICE_PER_LOG));
+            pressButton(b);
+
+        } else if (tf != null && (b = button(ws, "next")) != null) {
+
+            tf.setText(String.valueOf(TARGET_LOGS));
+            pressButton(b);
+
+        } else if (tf != null && title.contains("result")) {
+
+            b = spruceLogButton(ws);
+            if (b == null) {
+                return;
+            }
+            pressButton(b);
+
+        } else if (tf != null && (b = button(ws, "search")) != null) {
+
+            tf.setText(ORDER_ITEM_NAME);
+            pressButton(b);
+
+        } else {
+            return;
+        }
+
+        lastPressTick = tickCounter;
     }
 
     private static void orderWait(MinecraftClient c) {
