@@ -530,7 +530,7 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /* ======================================================== */
-    /*                  CRAFTING (logs -> planks)               */
+    /*            CRAFTING (logs -> planks, table)               */
     /* ======================================================== */
 
     private static void craftOpen(MinecraftClient c) {
@@ -544,59 +544,91 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        c.setScreen(new InventoryScreen(c.player));
+        BlockPos pos = findCraftingTable(c);
+
+        if (pos == null) {
+            stop(c, "No crafting table within reach. Place one next to you.");
+            return;
+        }
+
+        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+        c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
+
         resultWait = 0;
         craftFails = 0;
         placeTries = 0;
         noProgress = 0;
         lastGridPlanks = -1;
         setPhase(Phase.CRAFT);
-        cooldown = 3;
     }
 
+    /** Logs -> planks in the CRAFTING TABLE (many servers block the 2x2 inventory grid). */
     private static void craft(MinecraftClient c) {
 
-        if (!(c.currentScreen instanceof InventoryScreen)) {
-            if (phaseTicks > 10) {
-                stop(c, "Inventory closed.");
+        if (phaseTicks > 6000) {
+            stop(c, "Plank crafting timed out.");
+            return;
+        }
+
+        if (!(c.player.currentScreenHandler instanceof CraftingScreenHandler h)) {
+            if (phaseTicks > 30) {
+                if (++tableRetries > 3) {
+                    stop(c, "Could not open the crafting table.");
+                } else {
+                    setPhase(Phase.CRAFT_OPEN);
+                }
             }
             return;
         }
 
-        PlayerScreenHandler h = c.player.playerScreenHandler;
-        ItemStack cursor = h.getCursorStack();
+        tableRetries = 0;
 
-        // 1) Something on the cursor: logs -> grid, anything else -> back into the inventory.
+        // 1) Something on the cursor: logs -> grid cell 1, anything else -> back into the inventory.
+        ItemStack cursor = h.getCursorStack();
         if (!cursor.isEmpty()) {
             if (cursor.isOf(Items.SPRUCE_LOG) && h.getSlot(1).getStack().isEmpty()) {
                 if (++placeTries > 10) {
-                    stop(c, "Server keeps rejecting the log placement. See logs/latest.log.");
+                    LOG.info("Log placement rejected: cursor={} x{}, grid slot 1 = {}",
+                        cursor.getItem(), cursor.getCount(), h.getSlot(1).getStack());
+                    stop(c, "Server keeps rejecting log placement. See logs/latest.log.");
                     return;
                 }
                 click(c, h, 1, SlotActionType.PICKUP);
             } else {
-                stashCursor(c, h, 9, 45);
+                stashCursor(c, h, T_INV_FROM, T_INV_TO);
             }
             cooldown = 3;
             return;
         }
 
-        // 2) Logs in the grid -> wait for the server's result, then shift-click it.
-        if (gridHasItems(h)) {
+        // 2) Inspect the grid.
+        int gridLogs = 0;
+        boolean has = false;
 
-            if (!gridOnlyLogs(h)) {
+        for (int i = 1; i <= 9; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isEmpty()) {
+                continue;
+            }
+            has = true;
+            if (!st.isOf(Items.SPRUCE_LOG)) {
                 stop(c, "Remove other items from the crafting grid.");
                 return;
             }
+            gridLogs += st.getCount();
+        }
+
+        // 3) Logs in the grid -> wait for the server's result, then shift-click it.
+        if (has) {
 
             if (h.getSlot(0).getStack().isEmpty()) {
                 if (++resultWait > 20) {
                     resultWait = 0;
                     if (++craftFails > 4) {
-                        stop(c, "Crafting result never appears (server blocks the 2x2 grid?).");
+                        stop(c, "Plank result never appears. See logs/latest.log.");
                         return;
                     }
-                    for (int i = 1; i <= 4; i++) {
+                    for (int i = 1; i <= 9; i++) {
                         if (!h.getSlot(i).getStack().isEmpty()) {
                             click(c, h, i, SlotActionType.QUICK_MOVE);
                         }
@@ -608,20 +640,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
             resultWait = 0;
 
-            int gridLogs = 0;
-            for (int i = 1; i <= 4; i++) {
-                gridLogs += h.getSlot(i).getStack().getCount();
-            }
-
             if (gridLogs == lastGridPlanks) {
                 if (++noProgress >= 3) {
-                    // no room for more planks -> turn planks into slabs, then come back for the rest
+                    // no room for more planks -> logs back, planks -> slabs, then return
                     noProgress = 0;
                     lastGridPlanks = -1;
+                    for (int i = 1; i <= 9; i++) {
+                        if (!h.getSlot(i).getStack().isEmpty()) {
+                            click(c, h, i, SlotActionType.QUICK_MOVE);
+                        }
+                    }
                     if (count(c, Items.SPRUCE_PLANKS) >= 3) {
-                        c.player.closeHandledScreen();
-                        setPhase(Phase.TABLE_OPEN);
-                        cooldown = 6;
+                        endPlanks(c);
                     } else {
                         stop(c, "No room for planks.");
                     }
@@ -639,21 +669,31 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        // 3) Grid empty -> pick up the next log stack (placed on the next tick).
+        // 4) Grid empty.
         lastGridPlanks = -1;
         noProgress = 0;
 
-        int ls = findSlotWith(h, Items.SPRUCE_LOG);
+        // Inventory getting full of planks -> make slabs first (they take far less space).
+        if (countFree(h, T_INV_FROM, T_INV_TO) < 5 && count(c, Items.SPRUCE_PLANKS) >= 3) {
+            endPlanks(c);
+            return;
+        }
+
+        int ls = findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO);
 
         if (ls == -1) {
-            c.player.closeHandledScreen();
-            setPhase(Phase.TABLE_OPEN);
-            cooldown = 6;
+            endPlanks(c);
             return;
         }
 
         click(c, h, ls, SlotActionType.PICKUP);
         cooldown = 3;
+    }
+
+    private static void endPlanks(MinecraftClient c) {
+        c.player.closeHandledScreen();
+        setPhase(Phase.TABLE_OPEN);
+        cooldown = 6;
     }
 
     /* ======================================================== */
