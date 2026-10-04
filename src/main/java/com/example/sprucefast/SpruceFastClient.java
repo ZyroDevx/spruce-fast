@@ -116,9 +116,9 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int RESULT_TIMEOUT = 20; // ticks to wait for the result slot to show up
 
     /* ---------------- TIMING (ticks) ---------------- */
-    private static final int OPEN_WAIT     = 10; // wait after the crafting table opens before the first click
-    private static final int CLICK_GAP     = 2;  // ticks between queued (manual) inventory clicks
-    private static final int SETTLE        = 5;  // wait after manual clicks before checking the result
+    private static final int OPEN_WAIT     = 3; // wait after the crafting table opens before the first click
+    private static final int CLICK_GAP     = 1;  // ticks between queued (manual) inventory clicks
+    private static final int SETTLE        = 2;  // wait after manual clicks before checking the result
     private static final int DIALOG_SETTLE = 2;  // a fresh dialog must exist this long before we click
     private static final int PRESS_RETRY   = 15; // ticks before re-clicking the same dialog
 
