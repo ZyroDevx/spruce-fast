@@ -12,6 +12,7 @@ import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.Element;
 import net.minecraft.client.gui.ParentElement;
 import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.gui.widget.ClickableWidget;
 import net.minecraft.client.gui.widget.PressableWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
@@ -27,6 +28,9 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 
+import net.minecraft.recipe.NetworkRecipeId;
+import net.minecraft.recipe.RecipeDisplayEntry;
+import net.minecraft.recipe.display.SlotDisplayContexts;
 import net.minecraft.screen.CraftingScreenHandler;
 import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
@@ -48,15 +52,29 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Predicate;
 
 /**
  * Cycle: /orders (buy 576 spruce logs @ 53 each) -> wait -> collect
- *        -> walk onto the DEEPSLATE block -> crafting table (logs -> planks -> slabs),
- *           slabs are dropped DIRECTLY from the result slot (Ctrl+Q) onto the COBBLESTONE area
+ *        -> walk onto the DEEPSLATE block
+ *        -> RECIPE BOOK crafting:
+ *             logs   -> planks : player inventory (E), recipe book fills the 2x2 grid, shift-click the result
+ *             planks -> slabs  : crafting table, recipe book fills the 3x3 grid, Ctrl+Q on the result slot
+ *                                drops every slab straight onto the COBBLESTONE area
  *        -> walk onto the COBBLESTONE block -> /sell until no slabs are left
  *        -> walk back onto the deepslate block -> repeat.
+ *
+ * How the recipe book is used: the mod looks the recipe up in the client's real recipe book
+ * (the same list the recipe book screen shows) and sends the vanilla "craft request" packet,
+ * exactly what a click on the recipe in the book sends. The SERVER then moves the ingredients into the
+ * grid. It does not matter whether the recipe book panel is open or closed.
+ *
+ * Fallbacks (automatic, so the mod never gets stuck):
+ *   inventory crafting does not work on the server  -> planks are crafted in the crafting table instead
+ *   recipe book does not work in the table          -> the grid is loaded by hand (old method)
  *
  * Farm layout (found automatically within LAYOUT_RADIUS blocks):
  *   crafting table  - nearest one to the player when the mod is started
@@ -78,20 +96,29 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
     private static final boolean LOOP      = true;  // repeat the whole cycle
-    private static final boolean DIRECT_LOAD = true; // planks go straight from the inventory into the crafting grid (no hotbar stopover)
+    private static final boolean USE_RECIPE_BOOK = true;       // fill the grid with ONE recipe-book click (falls back to manual loading)
+    private static final boolean PLANKS_IN_INVENTORY = true;   // craft planks in the inventory (E); false = craft them in the table
+    private static final boolean DIRECT_LOAD = true; // manual fallback: planks go straight from the inventory into the crafting grid
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
     /* ---------------- FARM LAYOUT ---------------- */
-    private static final Block STAND_BLOCK = Blocks.DEEPSLATE;    // stand here to use the crafting table + throw slabs
+    private static final Block STAND_BLOCK = Blocks.DEEPSLATE;    // stand here to craft + throw slabs
     private static final Block DROP_BLOCK  = Blocks.COBBLESTONE;  // slabs are thrown here; stand here to sell
     private static final int    LAYOUT_RADIUS = 16;   // search radius (blocks) for table / deepslate / cobblestone
     private static final double TABLE_REACH   = 4.4;  // max eye-to-table distance when standing on the deepslate
-    private static final float  THROW_PITCH_TWEAK = 0.0f; // add degrees if slabs land short (-) or long (+)... see notes
+    private static final float  THROW_PITCH_TWEAK = 0.0f; // add/subtract degrees if slabs land short/long
+
+    /* ---------------- CRAFTING TUNING ---------------- */
+    private static final int LOW_FREE    = 5;   // fewer free slots than this -> turn planks into slabs before loading more logs
+    private static final int RESUME_FREE = 20;  // ...and keep making slabs until this many slots are free (fewer screen switches)
+    private static final int FILL_TIMEOUT   = 16; // ticks to wait for the server to fill the grid after a recipe click
+    private static final int ACK_TIMEOUT    = 8;  // ticks to wait for the server to react to a craft click
+    private static final int RESULT_TIMEOUT = 20; // ticks to wait for the result slot to show up
 
     /* ---------------- TIMING (ticks) ---------------- */
     private static final int OPEN_WAIT     = 10; // wait after the crafting table opens before the first click
-    private static final int CLICK_GAP     = 2;  // ticks between queued inventory clicks
-    private static final int SETTLE        = 5;  // wait after a craft click before checking the result
+    private static final int CLICK_GAP     = 2;  // ticks between queued (manual) inventory clicks
+    private static final int SETTLE        = 5;  // wait after manual clicks before checking the result
     private static final int DIALOG_SETTLE = 2;  // a fresh dialog must exist this long before we click
     private static final int PRESS_RETRY   = 15; // ticks before re-clicking the same dialog
 
@@ -103,10 +130,14 @@ public class SpruceFastClient implements ClientModInitializer {
         IDLE,
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
-        TABLE_OPEN, TABLE,
+        TABLE_OPEN, INV_CRAFT, TABLE,
         GO_DROP, PICKUP_WAIT,
         SELL_CMD, SELL_GUI
     }
+
+    private enum Fill { SENT, WAIT, FAIL }
+
+    private static final int JOB_NONE = 0, JOB_PLANKS = 1, JOB_SLABS = 2;
 
     private static KeyBinding startKey;
 
@@ -132,18 +163,30 @@ public class SpruceFastClient implements ClientModInitializer {
     private static boolean confirmedSell = false;
 
     private static int tableRetries = 0;
-    private static int noProgress = 0;
-    private static int gridReturns = 0;
     private static int tableAimStage = 0;
     private static boolean droppedAny = false;
     private static int tableSeenSync = -1;
     private static int tableReadyAt = 0;
     private static int tableCloses = 0;
+    private static int invCloses = 0;
     private static int foreignCount = 0;
     private static final ArrayDeque<Runnable> clickQueue = new ArrayDeque<>();
-    private static int lastGridPlanks = -1;
     private static int pickupLastCount = -1;
     private static int pickupStable = 0;
+
+    // crafting state
+    private static int noProgress = 0;
+    private static int gridReturns = 0;
+    private static int lastGridPlanks = -1;   // item count in the grid when the last craft click was sent
+    private static int craftSentTick = -1;    // tick of the last craft click (-1 = none pending)
+    private static int fillSentTick = -1;     // tick of the last recipe click (-1 = none pending)
+    private static int fillFails = 0;
+    private static int resultWait = 0;
+    private static int recipeLookups = 0;
+    private static boolean invFailed = false;        // crafting in the inventory (E) doesn't work here
+    private static boolean tableBookFailed = false;  // recipe book doesn't work in the table
+    private static boolean preferSlabs = false;      // hysteresis: keep making slabs until there is room again
+    private static final Map<Item, NetworkRecipeId> recipeCache = new HashMap<>();
 
     // farm layout (resolved in start())
     private static BlockPos tablePos = null;
@@ -223,6 +266,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case COLLECT_CMD  -> collectCmd(c);
             case COLLECT_GUI  -> collectGui(c);
             case TABLE_OPEN   -> tableOpen(c);
+            case INV_CRAFT    -> invCraft(c);
             case TABLE        -> table(c);
             case GO_DROP      -> goDrop(c);
             case PICKUP_WAIT  -> pickupWait(c);
@@ -246,9 +290,16 @@ public class SpruceFastClient implements ClientModInitializer {
         collectedTotal = 0;
         tableRetries = 0;
         tableCloses = 0;
+        invCloses = 0;
         foreignCount = 0;
         droppedAny = false;
         tableAimStage = 0;
+        invFailed = false;
+        tableBookFailed = false;
+        preferSlabs = false;
+        recipeLookups = 0;
+        recipeCache.clear();
+        craftReset();
         pendingChat = null;
 
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
@@ -754,16 +805,19 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /* ======================================================== */
-    /*       CRAFTING TABLE (stand on deepslate, throw slabs)   */
+    /*     CRAFTING (stand on deepslate, recipe book, throw)    */
     /* ======================================================== */
 
     /*
      * CraftingScreenHandler slots:
      *   0 = result, 1-9 = grid, 10-36 = inventory, 37-45 = hotbar
+     * PlayerScreenHandler slots:
+     *   0 = result, 1-4 = grid, 5-8 = armor, 9-35 = inventory, 36-44 = hotbar, 45 = offhand
      */
     private static final int T_INV_FROM = 10;
     private static final int T_INV_TO   = 46;
 
+    /** Which crafting screen do we need next? Walks to the deepslate block first and opens it. */
     private static void tableOpen(MinecraftClient c) {
 
         // Nothing left to craft -> go sell what is in the inventory / on the ground.
@@ -774,6 +828,12 @@ public class SpruceFastClient implements ClientModInitializer {
             } else {
                 afterSell(c);
             }
+            return;
+        }
+
+        if (peekJob(c) == JOB_NONE) {
+            releaseKeys(c);
+            finishCrafting(c);
             return;
         }
 
@@ -799,9 +859,15 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        // 2) Planks are crafted in the player inventory (E) - no table needed for that.
+        if (peekJob(c) == JOB_PLANKS && invUsable()) {
+            openInventory(c);
+            return;
+        }
+
         Vec3d center = Vec3d.ofCenter(tablePos);
 
-        // 2) Stage 0: work out the throw direction, then LOOK at the table (servers check where we look).
+        // 3) Stage 0: work out the throw direction, then LOOK at the table (servers check where we look).
         if (tableAimStage == 0) {
             computeThrowAim(c);
             aimAt(c, center);
@@ -812,7 +878,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tableAimStage = 0;
 
-        // 3) Stage 1: use the block exactly where the crosshair points.
+        // 4) Stage 1: use the block exactly where the crosshair points.
         Vec3d eye = c.player.getEyePos();
         Vec3d end = eye.add(c.player.getRotationVec(1.0f).multiply(5.0));
 
@@ -826,23 +892,63 @@ public class SpruceFastClient implements ClientModInitializer {
         c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
         c.player.swingHand(Hand.MAIN_HAND);
 
-        noProgress = 0;
-        gridReturns = 0;
-        lastGridPlanks = -1;
+        craftReset();
         tableSeenSync = -1;
         setPhase(Phase.TABLE);
     }
 
-    /*
-     * Everything happens inside the REAL crafting table (server-side container):
-     *   logs   -> planks  (1 log stack in the grid, shift-click the result -> planks go to the inventory)
-     *   planks -> slabs   (3 plank stacks in the bottom row, Ctrl+Q on the RESULT slot: the server crafts
-     *                      and drops every slab straight away - they never touch the inventory)
-     *
-     * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
-     * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
-     * anti-cheat see human-like inventory activity.
-     */
+    /** Opens the player inventory (like pressing E) for the 2x2 recipe-book crafting. */
+    private static void openInventory(MinecraftClient c) {
+        computeThrowAim(c);
+        c.player.setYaw(throwYaw);       // (only matters if slabs have to be thrown from here)
+        c.player.setPitch(throwPitch);
+        craftReset();
+        c.setScreen(new InventoryScreen(c.player));
+        setPhase(Phase.INV_CRAFT);
+        cooldown = 2;
+    }
+
+    private static boolean invUsable() {
+        return PLANKS_IN_INVENTORY && USE_RECIPE_BOOK && !invFailed;
+    }
+
+    private static void craftReset() {
+        noProgress = 0;
+        gridReturns = 0;
+        lastGridPlanks = -1;
+        craftSentTick = -1;
+        fillSentTick = -1;
+        fillFails = 0;
+        resultWait = 0;
+        clickQueue.clear();
+    }
+
+    /* ---------- the player inventory (E): logs -> planks ---------- */
+
+    private static void invCraft(MinecraftClient c) {
+
+        if (phaseTicks > 12000) {
+            stop(c, "Crafting timed out.");
+            return;
+        }
+
+        if (!(c.currentScreen instanceof InventoryScreen)) {
+            if (phaseTicks > 10) {
+                if (++invCloses > 3) {
+                    stop(c, "The inventory keeps closing.");
+                    return;
+                }
+                c.setScreen(new InventoryScreen(c.player));
+                phaseTicks = 0;
+            }
+            return;
+        }
+
+        craftLoop(c, c.player.playerScreenHandler, false);
+    }
+
+    /* ---------- the crafting table: planks -> slabs (and logs -> planks as a fallback) ---------- */
+
     private static void table(MinecraftClient c) {
 
         if (phaseTicks > 12000) {
@@ -853,7 +959,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (!(c.player.currentScreenHandler instanceof CraftingScreenHandler h)) {
 
             if (tableSeenSync != -1) {
-                // It was open and now it isn't: something closed it (items in the grid go back to the hotbar).
+                // It was open and now it isn't: something closed it (items in the grid go back to the inventory).
                 tableSeenSync = -1;
                 clickQueue.clear();
                 LOG.warn("Crafting table was CLOSED by the server (or another source). Reopening.");
@@ -886,7 +992,7 @@ public class SpruceFastClient implements ClientModInitializer {
             // face the cobblestone so Ctrl+Q throws land on it
             c.player.setYaw(throwYaw);
             c.player.setPitch(throwPitch);
-            clickQueue.clear();
+            craftReset();
             dumpTable(h, "table opened");
         }
 
@@ -894,7 +1000,68 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        // Queued clicks go out one at a time.
+        craftLoop(c, h, true);
+    }
+
+    /* ======================================================== */
+    /*                  SHARED CRAFTING LOOP                    */
+    /* ======================================================== */
+
+    /**
+     * Decides what to craft next:
+     *   planks while there is room for them, slabs when the inventory is getting full
+     *   (and then keeps making slabs until there is plenty of room again, so the screen
+     *   does not have to be switched all the time).
+     */
+    private static int nextJob(int logs, boolean slabsPossible, int free) {
+
+        if (preferSlabs && slabsPossible && free < RESUME_FREE) {
+            return JOB_SLABS;
+        }
+
+        preferSlabs = false;
+
+        if (logs > 0 && (free >= LOW_FREE || !slabsPossible)) {
+            return JOB_PLANKS;
+        }
+
+        if (slabsPossible) {
+            preferSlabs = logs > 0;
+            return JOB_SLABS;
+        }
+
+        return JOB_NONE;
+    }
+
+    private static boolean slabsPossible(int planksTotal, int planksStacks) {
+        // the recipe book spreads any amount of planks over the 3 cells; manual loading needs 3 stacks
+        boolean book = USE_RECIPE_BOOK && !tableBookFailed;
+        return book ? planksTotal >= 3 : planksStacks >= 3;
+    }
+
+    /** Same decision, from the player inventory (used before a crafting screen is open). */
+    private static int peekJob(MinecraftClient c) {
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+        int logs = countOf(h, Items.SPRUCE_LOG, 9, 45);
+        int planks = countOf(h, Items.SPRUCE_PLANKS, 9, 45);
+        int stacks = stacksOf(h, Items.SPRUCE_PLANKS, 9, 45);
+        return nextJob(logs, slabsPossible(planks, stacks), countFree(h, 9, 45));
+    }
+
+    /**
+     * One step of crafting for either screen:
+     *   inventory (isTable == false): logs -> planks   (recipe click, shift-click result)
+     *   table     (isTable == true) : planks -> slabs  (recipe click, Ctrl+Q on the result slot)
+     *                                 logs -> planks   only if inventory crafting is unusable
+     * Polls every tick (no fixed delays): it acts as soon as the server has answered.
+     */
+    private static void craftLoop(MinecraftClient c, ScreenHandler h, boolean isTable) {
+
+        final int invFrom = isTable ? T_INV_FROM : 9;
+        final int invTo = isTable ? T_INV_TO : 45;
+        final int gridLast = isTable ? 9 : 4;
+
+        // Queued (manual) clicks go out one at a time.
         if (!clickQueue.isEmpty()) {
             clickQueue.poll().run();
             cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
@@ -903,22 +1070,23 @@ public class SpruceFastClient implements ClientModInitializer {
 
         // We never use the cursor, but if something is stuck on it, put it away or drop it.
         if (!h.getCursorStack().isEmpty()) {
-            if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
+            if (!putCursorAway(c, h, invFrom, invTo)) {
                 c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
             }
-            cooldown = SETTLE;
+            cooldown = 2;
             return;
         }
 
+        int free = countFree(h, invFrom, invTo);
+
         /*
          * A) (Safety) Slabs that ended up in the inventory and the inventory is getting full
-         *    -> Ctrl+Q (drop the WHOLE stack) on every slab stack. Normally slabs are dropped
-         *    straight from the result slot (see B) and never get here.
+         *    -> Ctrl+Q (drop the WHOLE stack). Normally slabs are dropped straight from the
+         *    result slot and never get here.
          */
-        if (countFree(h, T_INV_FROM, T_INV_TO) < 4
-                && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
+        if (free < 4 && countOf(h, Items.SPRUCE_SLAB, invFrom, invTo) > 0) {
 
-            for (int i = T_INV_FROM; i < T_INV_TO; i++) {
+            for (int i = invFrom; i < invTo; i++) {
                 if (h.getSlot(i).getStack().isOf(Items.SPRUCE_SLAB)) {
                     q(c, h, i, 1, SlotActionType.THROW);
                     droppedAny = true;
@@ -928,15 +1096,13 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * B) Something in the grid -> craft it.
-         *      logs   : shift-click the result (planks go into the inventory)
-         *      planks : Ctrl+Q on the result slot (slabs are crafted and DROPPED directly)
+         * B) Inspect the grid.
          */
         int gridCount = 0;
         boolean gridHas = false;
-        boolean gridHasPlanks = false;
+        boolean gridPlanks = false;
 
-        for (int i = 1; i <= 9; i++) {
+        for (int i = 1; i <= gridLast; i++) {
 
             ItemStack st = h.getSlot(i).getStack();
 
@@ -944,9 +1110,11 @@ public class SpruceFastClient implements ClientModInitializer {
                 continue;
             }
 
-            if (!st.isOf(Items.SPRUCE_PLANKS) && !st.isOf(Items.SPRUCE_LOG)) {
+            boolean allowed = st.isOf(Items.SPRUCE_LOG) || (isTable && st.isOf(Items.SPRUCE_PLANKS));
 
-                // A foreign item: report it, send it back to the inventory and carry on.
+            if (!allowed) {
+
+                // Anything else (e.g. planks in the 2x2 grid would craft a crafting table!): send it back.
                 String name = st.getName().getString() + " x" + st.getCount() + " (grid slot " + i + ")";
                 LOG.warn("Foreign item in crafting grid: {}", name);
                 dumpTable(h, "foreign item");
@@ -965,85 +1133,259 @@ public class SpruceFastClient implements ClientModInitializer {
             gridCount += st.getCount();
 
             if (st.isOf(Items.SPRUCE_PLANKS)) {
-                gridHasPlanks = true;
+                gridPlanks = true;
             }
         }
 
+        /*
+         * C) Something in the grid -> craft it and collect the output.
+         */
         if (gridHas) {
 
-            if (lastGridPlanks == -1) {
-                lastGridPlanks = gridCount;
-            } else if (gridCount < lastGridPlanks) {
-                lastGridPlanks = gridCount;      // progress
-                noProgress = 0;
-                gridReturns = 0;
-            } else if (++noProgress >= 4) {
+            fillSentTick = -1;   // the grid is filled, so the recipe click (if any) worked
+            fillFails = 0;
 
-                dumpTable(h, "no crafting progress");
-
-                if (++gridReturns > 3) {
-                    stop(c, "Crafting makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.");
-                    return;
+            // wait for the server to show the crafting result
+            if (h.getSlot(0).getStack().isEmpty()) {
+                if (++resultWait > RESULT_TIMEOUT) {
+                    craftStuck(c, h, isTable, gridLast, "the result slot stays empty");
                 }
-
-                // give the grid contents back to the inventory and try again
-                for (int i = 1; i <= 9; i++) {
-                    if (!h.getSlot(i).getStack().isEmpty()) {
-                        q(c, h, i, 0, SlotActionType.QUICK_MOVE);
-                    }
-                }
-
-                noProgress = 0;
-                lastGridPlanks = -1;
                 return;
             }
 
-            if (gridHasPlanks) {
-                // Ctrl+Q on the result slot: the server crafts and drops slab after slab until
-                // the planks in the grid are used up. Nothing goes through the inventory.
+            resultWait = 0;
+
+            // a craft click is already on its way: wait for the grid to shrink
+            if (craftSentTick != -1) {
+
+                if (gridCount < lastGridPlanks) {
+                    // the server reacted (crafted at least part of it)
+                    craftSentTick = -1;
+                    noProgress = 0;
+                    gridReturns = 0;
+                } else if (tickCounter - craftSentTick < ACK_TIMEOUT) {
+                    return;
+                } else {
+                    craftSentTick = -1;
+                    if (++noProgress >= 3) {
+                        craftStuck(c, h, isTable, gridLast, "crafting made no progress");
+                        return;
+                    }
+                }
+            }
+
+            lastGridPlanks = gridCount;
+            craftSentTick = tickCounter;
+
+            if (gridPlanks) {
+                // Ctrl+Q on the result slot: the server crafts and DROPS slab after slab until the
+                // planks in the grid are used up. Nothing goes through the inventory.
                 c.interactionManager.clickSlot(h.syncId, 0, 1, SlotActionType.THROW, c.player);
                 droppedAny = true;
             } else {
+                // shift-click on the result slot: crafts the whole grid, planks go into the inventory
                 click(c, h, 0, SlotActionType.QUICK_MOVE);
             }
 
-            cooldown = SETTLE;
             return;
         }
-
-        if (lastGridPlanks != -1) {
-            gridReturns = 0; // grid went empty = it was crafted
-        }
-
-        lastGridPlanks = -1;
-        noProgress = 0;
 
         /*
-         * C) Grid empty -> load the next thing, or finish.
+         * D) Grid empty.
          */
-        boolean haveLogs = findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO) != -1;
-        boolean havePlanks = stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO) >= 3;
-        int freeNow = countFree(h, T_INV_FROM, T_INV_TO);
+        craftSentTick = -1;
+        lastGridPlanks = -1;
+        noProgress = 0;
+        gridReturns = 0;
+        resultWait = 0;
 
-        // logs first (ONE stack in the top-left cell) - unless the inventory is getting full
-        // of planks, then turn planks into slabs (and drop them) to make room first.
-        if (haveLogs && (freeNow >= 5 || !havePlanks)) {
-            queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});
+        // a recipe click is on its way: poll until the server has filled the grid
+        if (fillSentTick != -1) {
+            if (tickCounter - fillSentTick < FILL_TIMEOUT) {
+                return;
+            }
+            fillSentTick = -1;
+            recipeCache.clear();   // maybe the recipe id changed: look it up again
+            if (++fillFails >= 3) {
+                fillFailed(c, isTable, "the grid stayed empty after the recipe click");
+                return;
+            }
+        }
+
+        int logs = countOf(h, Items.SPRUCE_LOG, invFrom, invTo);
+        int planksTotal = countOf(h, Items.SPRUCE_PLANKS, invFrom, invTo);
+        int planksStacks = stacksOf(h, Items.SPRUCE_PLANKS, invFrom, invTo);
+
+        int job = nextJob(logs, slabsPossible(planksTotal, planksStacks), free);
+
+        /* ----- nothing left to craft ----- */
+        if (job == JOB_NONE) {
+            finishCrafting(c);
             return;
         }
 
-        // planks: three stacks side by side in the bottom row
-        if (havePlanks) {
-            queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});
+        /* ----- logs -> planks ----- */
+        if (job == JOB_PLANKS) {
+
+            if (isTable && invUsable()) {
+                // planks belong in the inventory screen: switch over
+                leaveCraft(c, Phase.TABLE_OPEN, 2);
+                return;
+            }
+
+            if (isTable && (!USE_RECIPE_BOOK || tableBookFailed)) {
+                queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});   // manual loading (old way)
+                return;
+            }
+
+            handleFill(c, recipeFill(c, h, Items.SPRUCE_PLANKS), isTable);
             return;
         }
 
-        // nothing left to craft -> walk to the cobblestone and sell
+        /* ----- planks -> slabs ----- */
+        if (!isTable) {
+            // slabs need the 3x3 grid: switch to the crafting table
+            leaveCraft(c, Phase.TABLE_OPEN, 2);
+            return;
+        }
+
+        if (!USE_RECIPE_BOOK || tableBookFailed) {
+            queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});   // three stacks side by side
+            return;
+        }
+
+        handleFill(c, recipeFill(c, h, Items.SPRUCE_SLAB), true);
+    }
+
+    private static void handleFill(MinecraftClient c, Fill r, boolean isTable) {
+        if (r == Fill.FAIL) {
+            fillFailed(c, isTable, "recipe not available");
+        }
+        // SENT: the next ticks poll for the filled grid.  WAIT: cooldown already set, we look again.
+    }
+
+    /** The recipe book can't be used in this screen: fall back to the next-best way. */
+    private static void fillFailed(MinecraftClient c, boolean isTable, String why) {
+
+        recipeCache.clear();
+        fillSentTick = -1;
+        fillFails = 0;
+        LOG.warn("Recipe book crafting failed in the {} ({}).", isTable ? "crafting table" : "inventory", why);
+
+        if (!isTable) {
+            invFailed = true;
+            info(c, "Inventory crafting doesn't work here - using the crafting table.");
+            leaveCraft(c, Phase.TABLE_OPEN, 4);
+        } else {
+            tableBookFailed = true;
+            info(c, "Recipe book doesn't work in the table - loading the grid by hand.");
+        }
+    }
+
+    /** The crafting made no progress (result never appears / server ignores the craft click). */
+    private static void craftStuck(MinecraftClient c, ScreenHandler h, boolean isTable, int gridLast, String why) {
+
+        dumpTable(h, why);
+
+        noProgress = 0;
+        craftSentTick = -1;
+        lastGridPlanks = -1;
+        resultWait = 0;
+
+        if (!isTable) {
+            invFailed = true;
+            LOG.warn("Inventory crafting failed ({}). Using the crafting table instead.", why);
+            info(c, "Inventory crafting doesn't work here - using the crafting table.");
+            leaveCraft(c, Phase.TABLE_OPEN, 4);   // closing the screen returns the grid contents to the inventory
+            return;
+        }
+
+        if (++gridReturns > 3) {
+            stop(c, "Crafting makes no progress (" + why + "). Check logs/latest.log.");
+            return;
+        }
+
+        if (gridReturns >= 2 && !tableBookFailed) {
+            tableBookFailed = true;
+            LOG.warn("Table crafting failed twice ({}): not using the recipe book any more.", why);
+            info(c, "Recipe book doesn't work in the table - loading the grid by hand.");
+        }
+
+        // give the grid contents back to the inventory and try again
+        for (int i = 1; i <= gridLast; i++) {
+            if (!h.getSlot(i).getStack().isEmpty()) {
+                q(c, h, i, 0, SlotActionType.QUICK_MOVE);
+            }
+        }
+    }
+
+    private static void leaveCraft(MinecraftClient c, Phase next, int wait) {
         c.player.closeHandledScreen();
+        tableAimStage = 0;
+        setPhase(next);
+        cooldown = wait;
+    }
+
+    private static void finishCrafting(MinecraftClient c) {
+        closeScreens(c);
         info(c, "Crafting finished. Walking to the cobblestone to sell...");
         setPhase(Phase.GO_DROP);
         cooldown = 3;
     }
+
+    /* ---------- recipe book ---------- */
+
+    /**
+     * Sends the vanilla "craft request" for a recipe, with "craft all" (like shift-clicking the recipe
+     * in the recipe book): the server takes the ingredients out of the inventory and puts them into the grid.
+     * SENT = request sent, WAIT = recipe not (yet) in the recipe book (it unlocks a moment after
+     * the ingredient is picked up), FAIL = recipe never showed up.
+     */
+    private static Fill recipeFill(MinecraftClient c, ScreenHandler h, Item result) {
+
+        NetworkRecipeId id = recipeCache.get(result);
+
+        if (id == null) {
+
+            id = findRecipe(c, result);
+
+            if (id == null) {
+                if (++recipeLookups > 40) {
+                    recipeLookups = 0;
+                    LOG.warn("No recipe for {} in the recipe book (not unlocked?).", result);
+                    return Fill.FAIL;
+                }
+                cooldown = 3;
+                return Fill.WAIT;
+            }
+
+            recipeLookups = 0;
+            recipeCache.put(result, id);
+        }
+
+        c.interactionManager.clickRecipe(h.syncId, id, true);   // true = craft all (fill the grid with as much as possible)
+        fillSentTick = tickCounter;
+        return Fill.SENT;
+    }
+
+    private static NetworkRecipeId findRecipe(MinecraftClient c, Item result) {
+
+        var ctx = SlotDisplayContexts.createParameters(c.world);
+
+        for (RecipeResultCollection collection : c.player.getRecipeBook().getOrderedResults()) {
+            for (RecipeDisplayEntry entry : collection.getAllRecipes()) {
+                for (ItemStack stack : entry.getStacks(ctx)) {
+                    if (stack.isOf(result)) {
+                        return entry.id();
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /* ---------- manual loading (fallback when the recipe book can't be used) ---------- */
 
     /** Queues one click; it is sent later, one per CLICK_GAP ticks. */
     private static void q(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
@@ -1058,8 +1400,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     /*
      * Queues "move one whole stack of `item` into each of the given cells" without the cursor:
-     * stacks already in the hotbar are swapped straight into the cell; others are first swapped
-     * into a free hotbar slot (an EMPTY one if possible, so nothing foreign can end up in the grid).
+     * stacks already in the hotbar are swapped straight into the cell; others are picked up and
+     * put into the cell (or go through a free hotbar slot if DIRECT_LOAD is off).
      */
     private static void queueLoad(MinecraftClient c, ScreenHandler h, Item item, int[] cells) {
 
@@ -1117,7 +1459,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (!DEBUG) {
             return;
         }
-        LOG.info("[TABLE] {} (syncId {})", why, h.syncId);
+        LOG.info("[CRAFT] {} (syncId {})", why, h.syncId);
         for (int i = 0; i < h.slots.size(); i++) {
             ItemStack st = h.getSlot(i).getStack();
             if (!st.isEmpty()) {
@@ -1506,13 +1848,6 @@ public class SpruceFastClient implements ClientModInitializer {
             if (h.getSlot(i).getStack().isOf(item)) n++;
         }
         return n;
-    }
-
-    private static int findIn(ScreenHandler h, Item item, int from, int to) {
-        for (int i = from; i < to; i++) {
-            if (h.getSlot(i).getStack().isOf(item)) return i;
-        }
-        return -1;
     }
 
     private static boolean putCursorAway(MinecraftClient c, ScreenHandler h, int from, int to) {
