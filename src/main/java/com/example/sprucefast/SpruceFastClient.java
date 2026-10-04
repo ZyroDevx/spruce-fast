@@ -54,7 +54,7 @@ import java.util.function.Predicate;
 /**
  * Cycle: /orders (buy 576 spruce logs @ 53 each) -> wait -> collect
  *        -> walk onto the DEEPSLATE block -> crafting table (logs -> planks -> slabs),
- *           throwing slabs onto the COBBLESTONE area when the inventory fills up
+ *           slabs are dropped DIRECTLY from the result slot (Ctrl+Q) onto the COBBLESTONE area
  *        -> walk onto the COBBLESTONE block -> /sell until no slabs are left
  *        -> walk back onto the deepslate block -> repeat.
  *
@@ -834,8 +834,9 @@ public class SpruceFastClient implements ClientModInitializer {
 
     /*
      * Everything happens inside the REAL crafting table (server-side container):
-     *   logs   -> planks  (1 log stack in the grid, shift-click the result)
-     *   planks -> slabs   (3 plank stacks in the bottom row, shift-click the result)
+     *   logs   -> planks  (1 log stack in the grid, shift-click the result -> planks go to the inventory)
+     *   planks -> slabs   (3 plank stacks in the bottom row, Ctrl+Q on the RESULT slot: the server crafts
+     *                      and drops every slab straight away - they never touch the inventory)
      *
      * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
      * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
@@ -909,8 +910,9 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * A) Running out of room -> Ctrl+Q (drop the WHOLE stack) on every slab stack.
-         *    They fly onto the cobblestone area.
+         * A) (Safety) Slabs that ended up in the inventory and the inventory is getting full
+         *    -> Ctrl+Q (drop the WHOLE stack) on every slab stack. Normally slabs are dropped
+         *    straight from the result slot (see B) and never get here.
          */
         if (countFree(h, T_INV_FROM, T_INV_TO) < 4
                 && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
@@ -925,10 +927,13 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         /*
-         * B) Something in the grid -> shift-click the result (crafts the whole grid).
+         * B) Something in the grid -> craft it.
+         *      logs   : shift-click the result (planks go into the inventory)
+         *      planks : Ctrl+Q on the result slot (slabs are crafted and DROPPED directly)
          */
         int gridCount = 0;
         boolean gridHas = false;
+        boolean gridHasPlanks = false;
 
         for (int i = 1; i <= 9; i++) {
 
@@ -957,6 +962,10 @@ public class SpruceFastClient implements ClientModInitializer {
 
             gridHas = true;
             gridCount += st.getCount();
+
+            if (st.isOf(Items.SPRUCE_PLANKS)) {
+                gridHasPlanks = true;
+            }
         }
 
         if (gridHas) {
@@ -988,7 +997,15 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
-            click(c, h, 0, SlotActionType.QUICK_MOVE);
+            if (gridHasPlanks) {
+                // Ctrl+Q on the result slot: the server crafts and drops slab after slab until
+                // the planks in the grid are used up. Nothing goes through the inventory.
+                c.interactionManager.clickSlot(h.syncId, 0, 1, SlotActionType.THROW, c.player);
+                droppedAny = true;
+            } else {
+                click(c, h, 0, SlotActionType.QUICK_MOVE);
+            }
+
             cooldown = SETTLE;
             return;
         }
@@ -1008,7 +1025,7 @@ public class SpruceFastClient implements ClientModInitializer {
         int freeNow = countFree(h, T_INV_FROM, T_INV_TO);
 
         // logs first (ONE stack in the top-left cell) - unless the inventory is getting full
-        // of planks, then turn planks into slabs (and throw them) to make room first.
+        // of planks, then turn planks into slabs (and drop them) to make room first.
         if (haveLogs && (freeNow >= 5 || !havePlanks)) {
             queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});
             return;
