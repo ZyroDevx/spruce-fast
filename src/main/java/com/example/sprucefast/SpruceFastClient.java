@@ -78,6 +78,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
     private static final boolean LOOP      = true;  // repeat the whole cycle
+    private static final boolean DIRECT_LOAD = true; // planks go straight from the inventory into the crafting grid (no hotbar stopover)
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
 
     /* ---------------- FARM LAYOUT ---------------- */
@@ -1079,17 +1080,26 @@ public class SpruceFastClient implements ClientModInitializer {
         for (int k = 0; k < srcs.size(); k++) {
 
             int src = srcs.get(k);
-            int hb;
 
             if (src >= 37) {
-                hb = src - 37;
-            } else {
-                hb = freeHotbar(h, hbUsed);
-                hbUsed[hb] = true;
-                q(c, h, src, hb, SlotActionType.SWAP);   // bring the stack into the hotbar
-            }
 
-            q(c, h, cells[k], hb, SlotActionType.SWAP);  // hotbar -> crafting cell
+                // already in the hotbar: ONE swap straight into the cell
+                q(c, h, cells[k], src - 37, SlotActionType.SWAP);
+
+            } else if (DIRECT_LOAD) {
+
+                // main inventory -> crafting cell directly: pick the stack up, put it in the cell
+                q(c, h, src, 0, SlotActionType.PICKUP);
+                q(c, h, cells[k], 0, SlotActionType.PICKUP);
+
+            } else {
+
+                // old way: hotbar stopover (set DIRECT_LOAD = false if the direct way misbehaves)
+                int hb = freeHotbar(h, hbUsed);
+                hbUsed[hb] = true;
+                q(c, h, src, hb, SlotActionType.SWAP);
+                q(c, h, cells[k], hb, SlotActionType.SWAP);
+            }
         }
     }
 
