@@ -54,8 +54,6 @@ import java.util.Locale;
  *   /orders (buy 144 empty buckets) -> wait -> collect
  *   -> put the bucket stacks into the nearby dispensers (water buckets come out)
  *   -> /ah sell water buckets 2% under the cheapest market listing
- *      (rotates through hotbar slots, refills the hotbar from the inventory,
- *       and strafes D/A while selling)
  *   -> empty the dispensers -> /sell leftovers -> repeat.
  */
 public class SpruceFastClient implements ClientModInitializer {
@@ -81,15 +79,21 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
     private static final int    ORDER_POLL_BUCKET     = 200;   // check the bucket order every 10 s
 
-    /* ---------------- ANTI-SPAM / MOVEMENT ---------------- */
-    private static final int AH_SELL_DELAY      = 40;     // ticks between /ah sell listings (2 s)
-    private static final int AH_SELL_JITTER     = 15;     // random extra ticks so it isn't perfectly regular
-    private static final int HOTBAR_SWAP_DELAY  = 4;      // ticks between inventory -> hotbar moves
-    private static final int STRAFE_TICKS       = 20 * 4; // hold D 4 s, then A 4 s
-
     /* ---------------- TIMING (ticks) ---------------- */
-    private static final int DIALOG_SETTLE = 2;  // a fresh dialog must exist this long before we click
-    private static final int PRESS_RETRY   = 15; // ticks before re-clicking the same dialog
+    private static final int DIALOG_SETTLE = 8;   // a fresh dialog must exist this long before we click
+    private static final int PRESS_RETRY   = 40;  // ticks before re-clicking the same dialog
+
+    /* ---------------- ANTI-SPAM (raise these if you still get kicked) ---------------- */
+    private static final int COMMAND_GAP_TICKS = 40;  // minimum gap between ANY two commands (2 s)
+    private static final int LIST_DELAY_TICKS  = 120; // pause after every /ah listing (6 s)
+    private static final int CLICK_GAP         = 8;   // gap between inventory / dispenser clicks
+    private static final int MENU_CLICK_DELAY  = 15;  // pause after a click in /orders menus
+    private static final int SELL_SYNC_WAIT    = 15;  // wait for server slot update before selling
+    private static final int SLOT_TIMEOUT      = 40;  // give up waiting for a slot change
+
+    /* ---------------- MOVEMENT WHILE SELLING ---------------- */
+    private static final boolean STRAFE_WHILE_SELLING = true;
+    private static final int     STRAFE_TICKS = 80;   // hold D for 4 s, then A for 4 s, and so on
 
     /* ========================================== */
 
@@ -101,7 +105,7 @@ public class SpruceFastClient implements ClientModInitializer {
         COLLECT_CMD, COLLECT_GUI,
         SELL_CMD, SELL_GUI,
         B_DISP_OPEN, B_DISP_GUI,
-        B_SELL_FIND, B_SELL_CMD, B_SELL_DIALOG, B_STRAFE_BACK
+        B_SELL_FIND, B_SELL_CMD, B_SELL_DIALOG, B_RETURN
     }
 
     private static KeyBinding bucketKey;
@@ -179,10 +183,7 @@ public class SpruceFastClient implements ClientModInitializer {
         tickCounter++;
         phaseTicks++;
 
-        // strafe every tick while selling (also during cooldowns)
-        if (phase == Phase.B_SELL_FIND || phase == Phase.B_SELL_CMD || phase == Phase.B_SELL_DIALOG) {
-            strafeTick(c);
-        }
+        strafeTick(c);
 
         if (pendingChat != null) {
             c.player.networkHandler.sendChatMessage(pendingChat);
@@ -208,7 +209,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case B_SELL_FIND   -> bucketSellFind(c);
             case B_SELL_CMD    -> bucketSellCmd(c);
             case B_SELL_DIALOG -> bucketSellDialog(c);
-            case B_STRAFE_BACK -> strafeBack(c);
+            case B_RETURN      -> bucketReturn(c);
             default -> { }
         }
     }
@@ -217,6 +218,7 @@ public class SpruceFastClient implements ClientModInitializer {
         phase = Phase.IDLE;
         releaseKeys(c);
         pendingChat = null;
+        pendingInvSlot = -1;
         if (c.player != null) {
             if (c.currentScreen instanceof HandledScreen<?>) {
                 c.player.closeHandledScreen();
@@ -236,10 +238,85 @@ public class SpruceFastClient implements ClientModInitializer {
         if (c.options != null) {
             c.options.forwardKey.setPressed(false);
             c.options.backKey.setPressed(false);
+            c.options.jumpKey.setPressed(false);
             c.options.leftKey.setPressed(false);
             c.options.rightKey.setPressed(false);
-            c.options.jumpKey.setPressed(false);
         }
+        strafeKeysDown = false;
+    }
+
+    /** Adds up to +1s of randomness so clicks don't look like a metronome. */
+    private static int jitter(int base) {
+        return base + (int) (Math.random() * 20);
+    }
+
+    /* ---------- command throttle ---------- */
+
+    private static int lastCommandTick = -1000;
+
+    /** Sends a command only if the last one was long enough ago. Returns false = try again next tick. */
+    private static boolean sendCmd(MinecraftClient c, String cmd) {
+        if (tickCounter - lastCommandTick < COMMAND_GAP_TICKS) {
+            return false;
+        }
+        lastCommandTick = tickCounter;
+        c.player.networkHandler.sendChatCommand(cmd);
+        return true;
+    }
+
+    /* ---------- strafing (D for 4 s, A for 4 s) while selling on the AH ---------- */
+
+    private static int strafeTicks = 0;
+    private static boolean strafeRight = true;
+    private static boolean strafeKeysDown = false;
+    private static Vec3d strafeOrigin = null;
+
+    private static void strafeTick(MinecraftClient c) {
+
+        boolean selling = phase == Phase.B_SELL_FIND || phase == Phase.B_SELL_CMD || phase == Phase.B_SELL_DIALOG;
+
+        if (!STRAFE_WHILE_SELLING || !selling || c.currentScreen != null) {
+            if (strafeKeysDown) {
+                c.options.leftKey.setPressed(false);
+                c.options.rightKey.setPressed(false);
+                strafeKeysDown = false;
+            }
+            return;
+        }
+
+        if (++strafeTicks >= STRAFE_TICKS) {
+            strafeTicks = 0;
+            strafeRight = !strafeRight;
+        }
+
+        c.options.rightKey.setPressed(strafeRight);
+        c.options.leftKey.setPressed(!strafeRight);
+        strafeKeysDown = true;
+    }
+
+    /** After selling: walk back to where selling started so the dispensers are in reach again. */
+    private static void bucketReturn(MinecraftClient c) {
+
+        if (c.currentScreen instanceof HandledScreen<?>) {
+            closeScreens(c);
+        }
+
+        if (strafeOrigin != null && phaseTicks < 400) {
+
+            double dx = strafeOrigin.x - c.player.getX();
+            double dz = strafeOrigin.z - c.player.getZ();
+
+            if (Math.sqrt(dx * dx + dz * dz) > 0.4) {
+                c.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                c.options.forwardKey.setPressed(true);
+                c.options.jumpKey.setPressed(c.player.horizontalCollision);
+                return;
+            }
+        }
+
+        releaseKeys(c);
+        cooldown = 10;
+        beginDispensers(c, true);
     }
 
     /** Turns the player to look at a point (yaw/pitch like vanilla). */
@@ -278,12 +355,14 @@ public class SpruceFastClient implements ClientModInitializer {
     /* ======================================================== */
 
     private static void orderCmd(MinecraftClient c) {
+        if (!sendCmd(c, ORDER_COMMAND)) {
+            return;
+        }
         orderStep = 0;
         dialogScreen = null;
         orderFilled = false;
-        c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.ORDER_GUI);
-        cooldown = 0;
+        cooldown = MENU_CLICK_DELAY;
     }
 
     /*
@@ -333,14 +412,14 @@ public class SpruceFastClient implements ClientModInitializer {
             if (s != -1) {
                 click(c, h, s, SlotActionType.PICKUP);
                 orderStep = 2;
-                cooldown = 0;
+                cooldown = MENU_CLICK_DELAY;
                 return;
             }
 
             s = find(h, cs, "your orders");
             if (s != -1 && clickOnce(c, hs, h, s)) {
                 orderStep = 1;
-                cooldown = 0;
+                cooldown = MENU_CLICK_DELAY;
             }
 
             return;
@@ -427,6 +506,7 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         lastPressTick = tickCounter;
+        cooldown = MENU_CLICK_DELAY;
     }
 
     private static void orderWait(MinecraftClient c) {
@@ -458,11 +538,13 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int lastOrdersCmdTick = -1000;
 
     private static void collectCmd(MinecraftClient c) {
+        if (!sendCmd(c, ORDER_COMMAND)) {
+            return;
+        }
         itemsAtCollectStart = count(c, JOB_ITEM);
         movedAny = false;
         orderFilled = false;
         lastOrdersCmdTick = tickCounter;
-        c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.COLLECT_GUI);
     }
 
@@ -497,10 +579,10 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (hs == null) {
             // /orders did not open (command swallowed / still closing a screen) -> send it again
-            if (c.currentScreen == null && tickCounter - lastOrdersCmdTick > 60) {
+            if (c.currentScreen == null && tickCounter - lastOrdersCmdTick > 100
+                    && sendCmd(c, ORDER_COMMAND)) {
                 lastOrdersCmdTick = tickCounter;
                 LOG.info("[COLLECT] /orders did not open - sending it again");
-                c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
             }
             return;
         }
@@ -521,7 +603,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
             if (quickMoveAllNow(c, h, 0, cs, JOB_ITEM)) {
                 movedAny = true;
-                cooldown = 4;
+                cooldown = MENU_CLICK_DELAY;
             } else if (movedAny) {
                 finishCollect(c, count(c, JOB_ITEM) - itemsAtCollectStart);
             }
@@ -583,7 +665,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (clickOnce(c, hs, h, s)) {
             LOG.info("[COLLECT] '{}' -> clicked slot {}", title, s);
-            cooldown = 3;
+            cooldown = MENU_CLICK_DELAY;
         }
     }
 
@@ -616,9 +698,12 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        if (!sendCmd(c, SELL_COMMAND)) {
+            return;
+        }
+
         movedItems = false;
         confirmedSell = false;
-        c.player.networkHandler.sendChatCommand(SELL_COMMAND);
         setPhase(Phase.SELL_GUI);
     }
 
@@ -704,19 +789,20 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int dispStage = 0;
     private static boolean dispActed = false;
     private static int dispRetries = 0;
+    private static int dispLeft = -1;
+    private static int dispClicks = 0;
 
     private static int bucketSold = 0;
     private static int bucketSellTarget = 0;
     private static int bucketIdle = 0;
     private static int bucketFail = 0;
 
-    // hotbar rotation + strafing
-    private static int hotbarRotor = 0;          // next hotbar slot (0-8) to try
-    private static int strafeTimer = 0;
-    private static boolean strafeRight = true;
-    private static int strafeNet = 0;            // +1 per tick right, -1 per tick left
-    private static int strafeBackTicks = 0;
-    private static boolean strafeBackRight = false;
+    /* Anti-spam: tracks an inventory slot we SWAP-clicked and are waiting on.
+       The slot is only clicked ONCE - we wait for the server's slot update
+       (the stack changing) before doing anything else. This stops the
+       duplicate-click spam that was getting the account kicked. */
+    private static int pendingInvSlot = -1;
+    private static int pendingSince = 0;
 
 
     private static void startBucket(MinecraftClient c) {
@@ -729,7 +815,7 @@ public class SpruceFastClient implements ClientModInitializer {
         collectedTotal = 0;
         sellAttempts = 0;
         pendingChat = null;
-        strafeNet = 0;
+        pendingInvSlot = -1;
 
 
         info(c, "BUCKET MODE ON - ordering " + BUCKET_ORDER_AMOUNT + " buckets @ " + BUCKET_ORDER_PRICE);
@@ -775,32 +861,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static int sellableCount(MinecraftClient c) {
         return count(c, Items.BUCKET) + count(c, Items.WATER_BUCKET);
-    }
-
-    /* ---------- strafing while selling ---------- */
-
-    private static void strafeTick(MinecraftClient c) {
-        c.options.rightKey.setPressed(strafeRight);
-        c.options.leftKey.setPressed(!strafeRight);
-        strafeNet += strafeRight ? 1 : -1;
-
-        if (++strafeTimer >= STRAFE_TICKS) {
-            strafeTimer = 0;
-            strafeRight = !strafeRight;
-        }
-    }
-
-    /** Walks back to the start position so the dispensers are in reach again. */
-    private static void strafeBack(MinecraftClient c) {
-        c.options.rightKey.setPressed(strafeBackRight);
-        c.options.leftKey.setPressed(!strafeBackRight);
-
-        if (phaseTicks >= strafeBackTicks) {
-            releaseKeys(c);
-            strafeNet = 0;
-            beginDispensers(c, true);
-            cooldown = 5;
-        }
     }
 
     /* ---------- dispensers ---------- */
@@ -870,7 +930,7 @@ public class SpruceFastClient implements ClientModInitializer {
         dispRetries = 0;
 
         setPhase(Phase.B_DISP_OPEN);
-        cooldown = empty ? 0 : 4;
+        cooldown = empty ? 0 : 10;
     }
 
     private static void dispOpen(MinecraftClient c) {
@@ -898,7 +958,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (dispStage == 0) {
             aimAt(c, center);
             dispStage = 1;
-            cooldown = 3;
+            cooldown = 8;
             return;
         }
 
@@ -920,6 +980,8 @@ public class SpruceFastClient implements ClientModInitializer {
         c.player.swingHand(Hand.MAIN_HAND);
 
         dispActed = false;
+        dispLeft = -1;
+        dispClicks = 0;
         setPhase(Phase.B_DISP_GUI);
     }
 
@@ -946,30 +1008,48 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (!dispActed) {
 
-            if (phaseTicks < 3) {
+            if (phaseTicks < 6) {
                 return; // let the contents arrive
             }
 
+            if (dispLeft < 0) {
+                dispLeft = dispEmptyMode ? 0 : dispAssign[dispIdx];
+                dispClicks = 0;
+            }
+
+            int slot = -1;
+
             if (!dispEmptyMode) {
-                // put this dispenser's share of bucket stacks in (shift-click)
-                int left = dispAssign[dispIdx];
-                for (int i = cs; i < h.slots.size() && left > 0; i++) {
-                    if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
-                        click(c, h, i, SlotActionType.QUICK_MOVE);
-                        left--;
+                // put this dispenser's share of bucket stacks in (one shift-click at a time)
+                if (dispLeft > 0) {
+                    for (int i = cs; i < h.slots.size(); i++) {
+                        if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
+                            slot = i;
+                            break;
+                        }
                     }
                 }
             } else {
-                // take everything out (shift-click every filled dispenser slot)
+                // take everything out (one shift-click at a time)
                 for (int i = 0; i < cs; i++) {
                     if (!h.getSlot(i).getStack().isEmpty()) {
-                        click(c, h, i, SlotActionType.QUICK_MOVE);
+                        slot = i;
+                        break;
                     }
                 }
             }
 
+            if (slot != -1 && ++dispClicks <= 40) {
+                click(c, h, slot, SlotActionType.QUICK_MOVE);
+                if (!dispEmptyMode) {
+                    dispLeft--;
+                }
+                cooldown = CLICK_GAP;
+                return;
+            }
+
             dispActed = true;
-            cooldown = 3;
+            cooldown = 8;
             return;
         }
 
@@ -986,7 +1066,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (dispIdx < dispensers.size()) {
             setPhase(Phase.B_DISP_OPEN);
-            cooldown = 3;
+            cooldown = 12;
             return;
         }
 
@@ -1001,49 +1081,35 @@ public class SpruceFastClient implements ClientModInitializer {
         bucketSold = 0;
         bucketIdle = 0;
         bucketFail = 0;
-        strafeTimer = 0;
+        lastHotbar = -1;
+        pendingInvSlot = -1;
+        strafeTicks = 0;
         strafeRight = true;
-        strafeNet = 0;
-        hotbarRotor = 0;
+        strafeOrigin = new Vec3d(c.player.getX(), c.player.getY(), c.player.getZ());
         info(c, "Dispensers loaded. Selling water buckets on the AH...");
         setPhase(Phase.B_SELL_FIND);
     }
 
     /* ---------- selling water buckets: hold -> /ah sell <price> -> Yes ---------- */
 
-    /** Next water bucket in the hotbar, starting at the rotor so it cycles through slots 1-9. */
-    private static int waterBucketSlot(MinecraftClient c) {
+    private static int lastHotbar = -1;   // hotbar index (0-8) used for the previous listing
+
+    /** Water bucket in the main inventory (not the hotbar), or -1. */
+    private static int inventoryWaterSlot(MinecraftClient c) {
         PlayerScreenHandler h = c.player.playerScreenHandler;
-        for (int k = 0; k < 9; k++) {
-            int idx = (hotbarRotor + k) % 9;
-            if (h.getSlot(36 + idx).getStack().isOf(Items.WATER_BUCKET)) {
-                return 36 + idx;
-            }
-        }
-        for (int i = 9; i <= 35; i++) {   // inventory fallback
+        for (int i = 9; i <= 35; i++) {
             if (h.getSlot(i).getStack().isOf(Items.WATER_BUCKET)) return i;
         }
         return -1;
     }
 
-    /** Moves ONE water bucket from the inventory into an empty/bucket hotbar slot. */
-    private static boolean refillHotbarOnce(MinecraftClient c) {
+    /** First EMPTY hotbar slot (0-8), or -1. */
+    private static int emptyHotbar(MinecraftClient c) {
         PlayerScreenHandler h = c.player.playerScreenHandler;
-
-        int src = -1;
-        for (int i = 9; i <= 35; i++) {
-            if (h.getSlot(i).getStack().isOf(Items.WATER_BUCKET)) { src = i; break; }
+        for (int i = 0; i < 9; i++) {
+            if (h.getSlot(36 + i).getStack().isEmpty()) return i;
         }
-        if (src == -1) return false;
-
-        for (int hb = 0; hb < 9; hb++) {
-            ItemStack st = h.getSlot(36 + hb).getStack();
-            if (st.isEmpty() || st.isOf(Items.BUCKET)) {
-                c.interactionManager.clickSlot(h.syncId, src, hb, SlotActionType.SWAP, c.player);
-                return true;
-            }
-        }
-        return false;
+        return -1;
     }
 
     private static void bucketSellFind(MinecraftClient c) {
@@ -1053,50 +1119,74 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        // top up the hotbar first (one move at a time, slowly)
-        if (refillHotbarOnce(c)) {
-            cooldown = HOTBAR_SWAP_DELAY;
-            return;
-        }
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+        int syncId = h.syncId;
 
-        int slot = waterBucketSlot(c);
-
-        if (slot == -1) {
-
-            bucketIdle++;
-
-            if (bucketIdle > BUCKET_IDLE_TICKS) {
-                if (bucketSold > 0) {
-                    finishBucketSelling(c);
-                } else {
-                    stop(c, "No water buckets arrived for 90 seconds.");
-                }
-            } else if (bucketIdle % 100 == 0) {
-                info(c, "Sold " + bucketSold + "/" + bucketSellTarget + " - waiting for water buckets...");
+        /* 0) We clicked a swap recently -> WAIT until the slot actually changes.
+              Clicking again now would spam the server and get you kicked. */
+        if (pendingInvSlot != -1) {
+            if (tickCounter - pendingSince > SLOT_TIMEOUT) {
+                pendingInvSlot = -1;                     // server never confirmed - retry fresh
+            } else if (h.getSlot(pendingInvSlot).getStack().isOf(Items.WATER_BUCKET)) {
+                return;                                  // still unchanged - do NOT click again
+            } else {
+                pendingInvSlot = -1;                     // confirmed - carry on
             }
+        }
+
+        /* 1) ANY hotbar slot holding a water bucket -> hold it.
+              Scans all 9 every pass, no fragile round-robin state. */
+        int hb = -1;
+        for (int i = 0; i < 9; i++) {
+            if (h.getSlot(36 + i).getStack().isOf(Items.WATER_BUCKET)) {
+                hb = i;
+                break;
+            }
+        }
+
+        if (hb != -1) {
+            bucketIdle = 0;
+            lastHotbar = hb;
+            c.player.getInventory().setSelectedSlot(hb);
+            cooldown = SELL_SYNC_WAIT;                   // let the server see the new held slot
+            setPhase(Phase.B_SELL_CMD);
             return;
         }
 
-        bucketIdle = 0;
-
-        // Hold it: select its hotbar slot, or swap it into the selected one.
-        var inv = c.player.getInventory();
-
-        if (slot >= 36 && slot <= 44) {
-            inv.setSelectedSlot(slot - 36);
-            hotbarRotor = (slot - 36 + 1) % 9;      // next listing uses the next hotbar slot
-        } else {
-            c.interactionManager.clickSlot(c.player.playerScreenHandler.syncId, slot,
-                inv.getSelectedSlot(), SlotActionType.SWAP, c.player);
+        /* 2) Nothing in the hotbar -> pull ONE bucket up from the inventory. */
+        int invSlot = inventoryWaterSlot(c);
+        if (invSlot != -1) {
+            int emptyHb = emptyHotbar(c);
+            int target = emptyHb != -1
+                    ? emptyHb
+                    : c.player.getInventory().getSelectedSlot();
+            c.interactionManager.clickSlot(syncId, invSlot, target, SlotActionType.SWAP, c.player);
+            pendingInvSlot = invSlot;
+            pendingSince = tickCounter;
+            cooldown = jitter(CLICK_GAP);
+            return;
         }
 
-        cooldown = 1;   // the server learns about the new selected slot on the next tick
-        setPhase(Phase.B_SELL_CMD);
+        /* 3) Nothing anywhere -> wait for dispensers to convert more. */
+        bucketIdle++;
+
+        if (bucketIdle > BUCKET_IDLE_TICKS) {
+            if (bucketSold > 0) {
+                finishBucketSelling(c);
+            } else {
+                stop(c, "No water buckets arrived for 90 seconds.");
+            }
+        } else if (bucketIdle % 100 == 0) {
+            info(c, "Sold " + bucketSold + "/" + bucketSellTarget + " - waiting for water buckets...");
+        }
     }
 
     private static void bucketSellCmd(MinecraftClient c) {
 
-        if (!c.player.getMainHandStack().isOf(Items.WATER_BUCKET)) {
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+        int held = 36 + c.player.getInventory().getSelectedSlot();
+
+        if (!h.getSlot(held).getStack().isOf(Items.WATER_BUCKET)) {
             if (++bucketFail > 25) {
                 stop(c, "Cannot hold the water bucket.");
                 return;
@@ -1105,7 +1195,9 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        c.player.networkHandler.sendChatCommand("ah sell " + LIST_PRICE);
+        if (!sendCmd(c, "ah sell " + LIST_PRICE)) {
+            return;   // command throttle - try again next tick
+        }
 
         dialogScreen = null;
         lastPressTick = -1000;
@@ -1120,8 +1212,8 @@ public class SpruceFastClient implements ClientModInitializer {
         if (dialogScreen != null && lastPressTick > -500 && sc != dialogScreen) {
             bucketSold++;
             bucketFail = 0;
-            cooldown = AH_SELL_DELAY + java.util.concurrent.ThreadLocalRandom.current().nextInt(AH_SELL_JITTER + 1);
             setPhase(Phase.B_SELL_FIND);
+            cooldown = jitter(LIST_DELAY_TICKS);   // 6-7 s between listings - no spam kicks
             return;
         }
 
@@ -1170,16 +1262,10 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     private static void finishBucketSelling(MinecraftClient c) {
-        info(c, "Sold " + bucketSold + " water buckets. Emptying the dispensers...");
+        info(c, "Sold " + bucketSold + " water buckets. Returning to the dispensers...");
         releaseKeys(c);
-
-        if (strafeNet != 0) {
-            strafeBackRight = strafeNet < 0;      // went too far left -> walk right
-            strafeBackTicks = Math.abs(strafeNet);
-            setPhase(Phase.B_STRAFE_BACK);
-        } else {
-            beginDispensers(c, true);
-        }
+        pendingInvSlot = -1;
+        setPhase(Phase.B_RETURN);
     }
 
     /* ======================================================== */
@@ -1239,15 +1325,6 @@ public class SpruceFastClient implements ClientModInitializer {
                 if (t.contains(k)) {
                     return i;
                 }
-            }
-        }
-        return -1;
-    }
-
-    private static int findItem(ScreenHandler h, int cs, Item item) {
-        for (int i = 0; i < cs; i++) {
-            if (h.getSlot(i).getStack().isOf(item)) {
-                return i;
             }
         }
         return -1;
