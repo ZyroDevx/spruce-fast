@@ -453,20 +453,24 @@ public class SpruceFastClient implements ClientModInitializer {
     /*                        COLLECTING                        */
     /* ======================================================== */
 
+    private static final int COLLECT_TIMEOUT = 240;   // ticks for the whole menu walk (4 menus, laggy server)
+    private static int lastOrdersCmdTick = -1000;
+
     private static void collectCmd(MinecraftClient c) {
         itemsAtCollectStart = count(c, JOB_ITEM);
         movedAny = false;
         orderFilled = false;
+        lastOrdersCmdTick = tickCounter;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
         setPhase(Phase.COLLECT_GUI);
     }
 
     /*
-     * Walkthrough (decided by the menu title, one action per menu, no delays):
+     * Walkthrough (decided by the menu title):
      *   "Orders (Page 1)"         -> click the "Your Orders" chest
-     *   "Orders -> Your Orders"   -> click the bucket order (only once fully delivered)
+     *   "Orders -> Your Orders"   -> click the bucket order (first slot) once it is fully delivered
      *   "Orders -> Edit Order"    -> click the "Collect" chest
-     *   "Orders -> Collect Items" -> shift-click all buckets
+     *   "Orders -> Collect Items" -> shift-click the buckets into the inventory
      */
     private static void collectGui(MinecraftClient c) {
 
@@ -477,7 +481,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (phaseTicks > 80) {
+        if (phaseTicks > COLLECT_TIMEOUT) {
             if (gained > 0) {
                 finishCollect(c, gained);
             } else {
@@ -489,7 +493,14 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         HandledScreen<?> hs = openContainer(c);
+
         if (hs == null) {
+            // /orders did not open (command swallowed / still closing a screen) -> send it again
+            if (c.currentScreen == null && tickCounter - lastOrdersCmdTick > 60) {
+                lastOrdersCmdTick = tickCounter;
+                LOG.info("[COLLECT] /orders did not open - sending it again");
+                c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
+            }
             return;
         }
 
@@ -504,10 +515,12 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        /* ---- Step 4: Collect Items -> move the buckets into the inventory ---- */
         if (title.contains("collect items")) {
 
             if (quickMoveAllNow(c, h, 0, cs, JOB_ITEM)) {
                 movedAny = true;
+                cooldown = 4;
             } else if (movedAny) {
                 finishCollect(c, count(c, JOB_ITEM) - itemsAtCollectStart);
             }
@@ -518,23 +531,70 @@ public class SpruceFastClient implements ClientModInitializer {
         int s;
 
         if (title.contains("edit order")) {
-            s = find(h, cs, "collect");
+
+            /* ---- Step 3: the "Collect" chest ---- */
+            s = findChest(h, cs, "collect");
+
         } else if (title.contains("your orders")) {
-            s = findItem(h, cs, JOB_ITEM);
-            // only claim once EVERYTHING has been delivered
-            if (s != -1 && !fullyDelivered(h.getSlot(s).getStack())) {
+
+            /* ---- Step 2: the bucket order (first slot) ---- */
+            s = -1;
+
+            for (int i = 0; i < cs; i++) {
+                if (h.getSlot(i).getStack().isOf(JOB_ITEM)) {
+                    s = i;
+                    if (fullyDelivered(h.getSlot(i).getStack())) {
+                        break;
+                    }
+                    s = -2;   // found one, but it is not complete yet - keep looking for a finished one
+                }
+            }
+
+            if (s == -2) {
                 closeScreens(c);
                 info(c, "Order not complete yet - waiting...");
                 setPhase(Phase.ORDER_WAIT);
                 return;
             }
+
+            if (s == -1 && !h.getSlot(0).getStack().isEmpty()) {
+                s = 0;   // fallback: first slot
+            }
+
         } else {
-            s = find(h, cs, "your orders");
+
+            /* ---- Step 1: the "Your Orders" chest in the main menu ---- */
+            s = findChest(h, cs, "your orders");
+
+            if (s == -1) {
+                for (int i = Math.max(0, cs - 9); i < cs; i++) {   // fallback: any chest in the bottom row
+                    if (h.getSlot(i).getStack().isOf(Items.CHEST)) {
+                        s = i;
+                        break;
+                    }
+                }
+            }
         }
 
-        if (s != -1) {
-            clickOnce(c, hs, h, s);
+        if (s == -1) {
+            return;
         }
+
+        if (clickOnce(c, hs, h, s)) {
+            LOG.info("[COLLECT] '{}' -> clicked slot {}", title, s);
+            cooldown = 3;
+        }
+    }
+
+    /** A chest whose name/lore contains the key (falls back to any item containing it). */
+    private static int findChest(ScreenHandler h, int cs, String key) {
+        for (int i = 0; i < cs; i++) {
+            ItemStack st = h.getSlot(i).getStack();
+            if (st.isOf(Items.CHEST) && textOf(st).contains(key)) {
+                return i;
+            }
+        }
+        return find(h, cs, key);
     }
 
     private static void finishCollect(MinecraftClient c, int gained) {
@@ -673,16 +733,18 @@ public class SpruceFastClient implements ClientModInitializer {
         setPhase(Phase.ORDER_CMD);
     }
 
-    /** The plain "Bucket" result button (not Water Bucket etc.). */
+    /**
+     * The plain "Bucket" result button (not Lava Bucket, Milk Bucket, Bucket of Axolotl ...).
+     * The button label starts with an icon/sprite, so the text is cleaned first:
+     * "[sprite] Bucket" / "<icon> Bucket" -> "bucket".
+     */
     private static ClickableWidget bucketResultButton(List<ClickableWidget> ws) {
 
         for (ClickableWidget w : ws) {
             if (!(w instanceof PressableWidget)) {
                 continue;
             }
-            // drop any leading icon character, then it must be exactly "bucket"
-            String t = w.getMessage().getString().trim().toLowerCase(Locale.ROOT).replaceAll("^[^a-z0-9]+", "");
-            if (t.equals("bucket")) {
+            if (cleanLabel(w.getMessage().getString()).equals("bucket")) {
                 return w;
             }
         }
@@ -690,10 +752,22 @@ public class SpruceFastClient implements ClientModInitializer {
         return null;
     }
 
+    private static String cleanLabel(String raw) {
+        return raw.toLowerCase(Locale.ROOT)
+            .replaceAll("\\[[^\\]]*\\]", " ")          // [sprite descriptions]
+            .replaceAll("[^\\p{L}\\p{N}() ]", " ")        // icon glyphs and other symbols
+            .replaceAll("\\s+", " ")
+            .trim();
+    }
+
     /** "144/144 Delivered" / "Order Completed" in the order's tooltip. */
     private static boolean fullyDelivered(ItemStack stack) {
         String t = textOf(stack);
-        return t.contains(BUCKET_ORDER_AMOUNT + "/" + BUCKET_ORDER_AMOUNT) || t.contains("order completed");
+        if (t.contains("order completed")) {
+            return true;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d+)\\s*/\\s*(\\d+)\\s*delivered").matcher(t);
+        return m.find() && m.group(1).equals(m.group(2));
     }
 
     private static int sellableCount(MinecraftClient c) {
@@ -1255,13 +1329,16 @@ public class SpruceFastClient implements ClientModInitializer {
         return -1;
     }
 
-    /** Click a slot, but not the same slot twice in a row on the same screen. */
+    private static int lastClickTick = -1000;
+
+    /** Click a slot, but not the same slot twice in a row on the same screen (retries after 30 ticks if nothing happened). */
     private static boolean clickOnce(MinecraftClient c, HandledScreen<?> hs, ScreenHandler h, int slot) {
         String key = hs.getTitle().getString() + ":" + slot;
-        if (key.equals(lastClickKey)) {
+        if (key.equals(lastClickKey) && tickCounter - lastClickTick < 30) {
             return false;
         }
         lastClickKey = key;
+        lastClickTick = tickCounter;
         click(c, h, slot, SlotActionType.PICKUP);
         return true;
     }
