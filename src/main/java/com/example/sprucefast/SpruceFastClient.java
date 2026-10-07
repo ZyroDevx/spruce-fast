@@ -1,6 +1,9 @@
 package com.example.sprucefast;
 
-import com.donututilities.client.PriceApi;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -46,6 +49,11 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -80,7 +88,9 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    MIN_LIST_PRICE        = 2000;  // never list below this
     private static final int    MAX_LIST_PRICE        = 20000; // never list above this
     private static final double UNDERCUT              = 0.98;  // list 2% below the cheapest listing (5K -> 4.9K)
-    private static final int    PRICE_REFRESH_MS      = 20000; // re-check the Market Tracking cache every 20 s
+    private static final String PRICE_API_BASE        = "https://donutsmp-api.donututilities.workers.dev"; // market price service
+    private static final String PRICE_API_TOKEN       = "";    // optional Bearer token, leave empty if not needed
+    private static final int    PRICE_FETCH_MIN_MS    = 30000; // never fetch prices more often than every 30 s
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
     private static final int    ORDER_POLL_BUCKET     = 200;   // check the bucket order every 10 s
 
@@ -641,7 +651,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static volatile long bucketPrice = -1;       // price we list water buckets for
     private static volatile long lowestMarketPrice = -1; // lowest current water-bucket market price
-    private static volatile long lastPriceFetchMs = 0;
     private static volatile String priceError = "";
 
     private static void startBucket(MinecraftClient c) {
@@ -655,7 +664,6 @@ public class SpruceFastClient implements ClientModInitializer {
         sellAttempts = 0;
         bucketPrice = -1;
         lowestMarketPrice = -1;
-        lastPriceFetchMs = 0;
         priceError = "";
         pendingChat = null;
 
@@ -909,9 +917,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void bucketSellFind(MinecraftClient c) {
 
-        if (System.currentTimeMillis() - lastPriceFetchMs > PRICE_REFRESH_MS) {
-            refreshMarketPrice(c);
-        }
+        refreshMarketPrice(c);   // throttled fetch + picks up the newest cached price
 
         if (bucketPrice < 0) {
             if (phaseTicks > 400) {
@@ -1039,66 +1045,143 @@ public class SpruceFastClient implements ClientModInitializer {
         beginDispensers(c, true);
     }
 
-    /* ---------- Market Tracking price source ---------- */
+    /* ---------- Built-in market price source ---------- */
 
-    /**
-     * Refreshes Donut Utilities' Market Tracking cache and reads the current
-     * lowest water-bucket price from PriceApi.
-     *
-     * Example: market lowest = 5000 -> 5000 * 0.98 = 4900 -> bucketPrice = 4900
-     */
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(5))
+        .build();
+
+    private static volatile long fetchedWaterLowest = -1;   // lowest water-bucket listing from the price service
+    private static volatile long lastFetchAttemptMs = 0;
+    private static volatile boolean fetchInFlight = false;
+
+    /** Starts a (throttled, async) price fetch and applies the newest known price. Call as often as you like. */
     private static void refreshMarketPrice(MinecraftClient c) {
+        fetchPrices();
+        applyPrice(c);
+    }
 
-        lastPriceFetchMs = System.currentTimeMillis();
+    /** Turns the lowest market price into our listing price (2% undercut, clamped). */
+    private static void applyPrice(MinecraftClient c) {
 
-        try {
-            PriceApi.refreshIfStale(c);
+        long lowest = fetchedWaterLowest;
 
-            PriceApi.Entry waterBucket = null;
+        if (lowest <= 0) {
+            return;
+        }
 
-            for (PriceApi.Entry entry : PriceApi.snapshot().values()) {
-                String key = entry.key() == null
-                    ? ""
-                    : entry.key().toLowerCase(Locale.ROOT);
+        long sellPrice = (long) Math.floor(lowest * UNDERCUT);
+        sellPrice = Math.max(MIN_LIST_PRICE, Math.min(MAX_LIST_PRICE, sellPrice));
 
-                String name = entry.name() == null
-                    ? ""
-                    : entry.name().toLowerCase(Locale.ROOT);
-
-                if (key.equals("water_bucket")
-                        || key.equals("minecraft:water_bucket")
-                        || name.equals("water bucket")
-                        || name.equals("water_bucket")) {
-                    waterBucket = entry;
-                    break;
-                }
-            }
-
-            if (waterBucket == null) {
-                throw new IllegalStateException("Market Tracking has no water bucket entry");
-            }
-
-            Long lowest = waterBucket.currentMinPrice();
-
-            if (lowest == null || lowest <= 0L) {
-                throw new IllegalStateException("Market Tracking has no current water bucket price");
-            }
-
-            long sellPrice = (long) Math.floor(lowest * UNDERCUT);
-            sellPrice = Math.max(MIN_LIST_PRICE, Math.min(MAX_LIST_PRICE, sellPrice));
-
+        if (sellPrice != bucketPrice) {
             lowestMarketPrice = lowest;
             bucketPrice = sellPrice;
-            priceError = "";
-
-            LOG.info("[MARKET] Water bucket lowest {} -> listing at {}", lowestMarketPrice, bucketPrice);
-
-            info(c, "Water bucket market: " + lowestMarketPrice + " -> selling at " + bucketPrice);
-
-        } catch (Exception e) {
-            priceError = e.getMessage() == null ? e.toString() : e.getMessage();
-            LOG.warn("[MARKET] Could not read water bucket price: {}", priceError);
+            LOG.info("[MARKET] Water bucket lowest {} -> listing at {}", lowest, sellPrice);
+            info(c, "Water bucket market: " + lowest + " -> selling at " + sellPrice);
         }
+    }
+
+    private static void fetchPrices() {
+
+        long now = System.currentTimeMillis();
+
+        if (fetchInFlight || now - lastFetchAttemptMs < PRICE_FETCH_MIN_MS) {
+            return;
+        }
+
+        lastFetchAttemptMs = now;
+
+        HttpRequest.Builder builder;
+
+        try {
+            builder = HttpRequest.newBuilder(URI.create(PRICE_API_BASE.replaceAll("/+$", "") + "/v1/prices"))
+                .header("Accept", "application/json")
+                .timeout(Duration.ofSeconds(5))
+                .GET();
+            if (!PRICE_API_TOKEN.isBlank()) {
+                builder.header("Authorization", "Bearer " + PRICE_API_TOKEN.trim());
+            }
+        } catch (Exception e) {
+            priceError = "Bad price service URL: " + e;
+            LOG.warn("[MARKET] {}", priceError);
+            return;
+        }
+
+        fetchInFlight = true;
+
+        HTTP.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString()).whenComplete((resp, err) -> {
+            try {
+                if (err != null || resp == null || resp.statusCode() != 200) {
+                    priceError = err != null ? err.toString() : "HTTP " + (resp == null ? "?" : resp.statusCode());
+                    LOG.warn("[MARKET] Price service failed ({}) - keeping last price", priceError);
+                    return;
+                }
+                parsePrices(resp.body());
+            } catch (Exception e) {
+                priceError = e.toString();
+                LOG.warn("[MARKET] Could not parse price service response: {}", priceError);
+            } finally {
+                fetchInFlight = false;
+            }
+        });
+    }
+
+    /** Expected JSON: { "items": [ { "key", "name", "enchants", "currentMinPrice", ... }, ... ] } */
+    private static void parsePrices(String body) {
+
+        JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+        JsonElement itemsEl = root.get("items");
+
+        if (itemsEl == null || !itemsEl.isJsonArray()) {
+            throw new IllegalStateException("price service returned no items");
+        }
+
+        JsonArray items = itemsEl.getAsJsonArray();
+        long best = -1;
+
+        for (JsonElement el : items) {
+
+            if (!el.isJsonObject()) {
+                continue;
+            }
+
+            JsonObject o = el.getAsJsonObject();
+
+            String key = jsonStr(o, "key").toLowerCase(Locale.ROOT);
+            String name = jsonStr(o, "name").toLowerCase(Locale.ROOT);
+            String enchants = jsonStr(o, "enchants");
+
+            boolean isWaterBucket = key.equals("water_bucket") || key.equals("minecraft:water_bucket")
+                || name.equals("water bucket") || name.equals("water_bucket");
+
+            if (!isWaterBucket || !enchants.isEmpty()) {
+                continue;
+            }
+
+            JsonElement price = o.get("currentMinPrice");
+
+            if (price == null || price.isJsonNull()) {
+                continue;
+            }
+
+            long p = price.getAsLong();
+
+            if (p > 0 && (best < 0 || p < best)) {
+                best = p;
+            }
+        }
+
+        if (best <= 0) {
+            throw new IllegalStateException("price service has no current water bucket price");
+        }
+
+        fetchedWaterLowest = best;
+        priceError = "";
+    }
+
+    private static String jsonStr(JsonObject o, String key) {
+        JsonElement e = o.get(key);
+        return e == null || e.isJsonNull() ? "" : e.getAsString();
     }
 
     /* ======================================================== */
