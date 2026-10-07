@@ -81,7 +81,7 @@ public class SpruceFastClient implements ClientModInitializer {
        Lower values = faster. 20 ticks = 1 second. */
     private static final int ORDER_SPEED_TICKS             = 4;   // order GUI actions
     private static final int ORDER_COLLECT_SPEED_TICKS      = 4;   // collect GUI actions
-    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 0.5;   // delay between bucket -> dispenser clicks
+    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 1;   // delay between bucket -> dispenser clicks
     private static final int SELLING_SPEED_TICKS            = 20;  // delay between AH listings
 
     private static final int    ORDER_POLL_BUCKET     = 60;   // check the order every 3 s (60 ticks)
