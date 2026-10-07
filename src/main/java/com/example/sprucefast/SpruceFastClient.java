@@ -74,14 +74,14 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    BUCKET_MIN_FREE_SLOTS = 12;    // water buckets don't stack
     private static final int    MAX_DISPENSERS        = 9;     // use the nearest N dispensers
     private static final double DISPENSER_REACH       = 4.3;   // max eye-to-dispenser distance
-    private static final String LIST_PRICE           = "10k";  // water buckets are listed with: /ah sell 6k
+    private static final String LIST_PRICE           = "6k";  // water buckets are listed with: /ah sell 6k
     private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
     /* ---------------- USER SPEED CONFIG ----------------
        Lower values = faster. 20 ticks = 1 second. */
     private static final int ORDER_SPEED_TICKS             = 4;   // order GUI actions
     private static final int ORDER_COLLECT_SPEED_TICKS      = 4;   // collect GUI actions
-    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 1;   // delay between bucket -> dispenser clicks
+    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 1;   // minimum is 1 tick (0.05s)
     private static final int SELLING_SPEED_TICKS            = 20;  // delay between AH listings
 
     private static final int    ORDER_POLL_BUCKET     = 60;   // check the order every 3 s (60 ticks)
@@ -255,7 +255,12 @@ public class SpruceFastClient implements ClientModInitializer {
 
     /** Sends a command only if the last one was long enough ago. Returns false = try again next tick. */
     private static boolean sendCmd(MinecraftClient c, String cmd) {
-        if (tickCounter - lastCommandTick < COMMAND_GAP_TICKS) {
+        return sendCmd(c, cmd, COMMAND_GAP_TICKS);
+    }
+
+    /** Sends a command with a custom minimum gap. */
+    private static boolean sendCmd(MinecraftClient c, String cmd, int gapTicks) {
+        if (tickCounter - lastCommandTick < Math.max(0, gapTicks)) {
             return false;
         }
         lastCommandTick = tickCounter;
@@ -1218,7 +1223,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (!sendCmd(c, "ah sell " + LIST_PRICE, SELLING_SPEED_TICKS)) {
+        if (!sendCmd(c, "ah sell " + LIST_PRICE)) {
             return;   // command throttle - try again next tick
         }
 
