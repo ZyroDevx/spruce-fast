@@ -1,5 +1,7 @@
 package com.example.sprucefast;
 
+import com.donututilities.client.PriceApi;
+
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
@@ -52,26 +54,17 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.Executor;
 import java.util.function.Predicate;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Cycle: /orders (buy 576 spruce logs @ 53 each) -> wait -> collect
- *        -> PLANKS : player inventory (E, 2x2 grid) + Recipe Book: logs -> planks (shift-click result)
- *        -> walk onto the DEEPSLATE block -> crafting table + Recipe Book: planks -> slabs,
+ *        -> walk onto the DEEPSLATE block -> crafting table (logs -> planks -> slabs),
  *           slabs are dropped DIRECTLY from the result slot (Ctrl+Q) onto the COBBLESTONE area
- *        -> (planks/slabs repeat while logs are left and the inventory has to be emptied in between)
  *        -> walk onto the COBBLESTONE block -> /sell until no slabs are left
  *        -> walk back onto the deepslate block -> repeat.
  *
@@ -81,16 +74,6 @@ import java.util.regex.Pattern;
  *   cobblestone     - the one nearest to the table  (slabs land here, player stands here to sell)
  *
  * BACKSPACE = start / stop.
- *
- * RECIPE BOOK NOTES
- *   "Selecting a recipe in the recipe book" is, in vanilla, exactly one call:
- *   ClientPlayerInteractionManager.clickRecipe(syncId, recipeId, craftAll), which sends a
- *   CraftRequestC2SPacket. The SERVER then moves the ingredients from the inventory into the grid.
- *   Whether the recipe book panel is open or closed on screen is purely cosmetic and has no
- *   influence on that packet, so nothing has to be toggled. The recipe id is looked up in the
- *   player's real (client) recipe book, so only recipes that are really unlocked can be used.
- *   Slabs (3 planks in a row) do not fit the 2x2 inventory grid, which is why they still need the
- *   real crafting table.
  */
 public class SpruceFastClient implements ClientModInitializer {
 
@@ -105,25 +88,9 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int POLL_TICKS    = 30;    // retry collecting every 1.5 s (orders fill instantly)
     private static final int REQUIRED_FREE_SLOTS = 34; // 576 logs -> 2304 planks = 36 stacks
     private static final boolean LOOP      = true;  // repeat the whole cycle
-    private static final boolean USE_RECIPE_BOOK = true; // fill the grid with ONE recipe-book click (falls back to manual loading per item)
-    private static final boolean DIRECT_LOAD = true; // (manual fallback only) stacks go straight from the inventory into the grid
+    private static final boolean USE_RECIPE_BOOK = true; // fill the grid with ONE recipe-book click (falls back to manual loading)
+    private static final boolean DIRECT_LOAD = true; // planks go straight from the inventory into the crafting grid (no hotbar stopover)
     private static final boolean DEBUG     = true;  // dumps every GUI to logs/latest.log
-
-    /* ---------------- DISCORD PROFIT WEBHOOK ---------------- */
-    // Create a Discord webhook in your channel and paste its URL here.
-    // No Python, no API key, and no Discord bot are required.
-    private static final String DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1546568205777113131/WgJwZZFq-L-rzGSqiltKkxZXfuxId2zw_IPFKWyb3EA8GJKBH2-f-BjNcmGwpolbtmNK";
-    private static final int ORDER_COST = TARGET_LOGS * PRICE_PER_LOG; // $30,528
-    private static final HttpClient PROFIT_HTTP = HttpClient.newHttpClient();
-
-    private static int sellBatchSlabs = 0;
-    private static boolean sellPayoutReceived = false;
-    private static double sellRevenue = 0.0;
-    private static int completedOrders = 0;
-    private static long profitStartTick = -1;
-    private static long lastDiscordUpdateTick = -999999;
-    private static String discordMessageId = null;
-
 
     /* ---------------- FARM LAYOUT ---------------- */
     private static final Block STAND_BLOCK = Blocks.DEEPSLATE;    // stand here to use the crafting table + throw slabs
@@ -132,24 +99,26 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final double TABLE_REACH   = 4.4;  // max eye-to-table distance when standing on the deepslate
     private static final float  THROW_PITCH_TWEAK = 0.0f; // add degrees if slabs land short (-) or long (+)... see notes
 
+    /* ---------------- BUCKET MODE (key: DELETE) ---------------- */
+    private static final int    BUCKET_ORDER_AMOUNT   = 144;   // 9 stacks of 16 empty buckets
+    private static final int    BUCKET_ORDER_PRICE    = 1000;  // per empty bucket ("1K")
+    private static final int    BUCKET_MIN_FREE_SLOTS = 12;    // water buckets don't stack
+    private static final int    MAX_DISPENSERS        = 9;     // use the nearest N dispensers
+    private static final double DISPENSER_REACH       = 4.3;   // max eye-to-dispenser distance
+    private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
+    private static final int    MIN_LIST_PRICE        = 2000;  // never list below this
+    private static final int    MAX_LIST_PRICE        = 20000; // never list above this
+    private static final double UNDERCUT              = 0.98;  // list 2% below the cheapest listing (5K -> 4.9K)
+    private static final int    PRICE_REFRESH_MS      = 20000; // re-check the Market Tracking cache every 20 s
+    private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
+    private static final int    ORDER_POLL_BUCKET     = 200;   // check the bucket order every 10 s
+
     /* ---------------- TIMING (ticks) ---------------- */
-    private static final int OPEN_WAIT     = 4;  // wait after the crafting table opens before the first click
-    private static final int INV_OPEN_WAIT = 2;  // wait after opening the player inventory before the first click
-    private static final int CLICK_GAP     = 2;  // ticks between queued inventory clicks (manual fallback)
-    private static final int SETTLE        = 5;  // wait after the last manual-fallback click
+    private static final int OPEN_WAIT     = 10; // wait after the crafting table opens before the first click
+    private static final int CLICK_GAP     = 2;  // ticks between queued inventory clicks
+    private static final int SETTLE        = 5;  // wait after a craft click before checking the result
     private static final int DIALOG_SETTLE = 2;  // a fresh dialog must exist this long before we click
     private static final int PRESS_RETRY   = 15; // ticks before re-clicking the same dialog
-
-    /* ---------------- RECIPE-BOOK CRAFTING (ticks) ---------------- */
-    // These are only MINIMUM waits. After that the mod polls the grid every tick and continues
-    // the moment the server's answer is visible; the TIMEOUTs only matter if the server is stuck.
-    private static final int FILL_MIN_WAIT  = 1;
-    private static final int FILL_TIMEOUT   = 30;  // 1.5 s without the grid being filled = fill failed
-    private static final int CRAFT_MIN_WAIT = 1;
-    private static final int CRAFT_TIMEOUT  = 30;  // 1.5 s without the grid being used up = crafting stalled
-    private static final int RECIPE_WAIT    = 40;  // how long to wait for a recipe to be unlocked in the book
-    private static final int PLANKS_MIN_FREE = 4;  // free slots needed before turning another log stack into planks
-    private static final int MAX_STAGE_ROUNDS = 12; // safety net against planks <-> slabs ping-pong
 
     /* ========================================== */
 
@@ -159,59 +128,17 @@ public class SpruceFastClient implements ClientModInitializer {
         IDLE,
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
-        PLANKS,
         TABLE_OPEN, TABLE,
         GO_DROP, PICKUP_WAIT,
-        SELL_CMD, SELL_GUI
+        SELL_CMD, SELL_GUI,
+        B_DISP_OPEN, B_DISP_GUI,
+        B_SELL_FIND, B_SELL_CMD, B_SELL_DIALOG
     }
 
-    private enum CraftState { WORKING, DONE, FAILED }
-
-    /** Describes one crafting stage (what goes in, what comes out, where the slots are). */
-    private static final class Spec {
-        final String name;
-        final Item input;
-        final Item output;
-        final int gridFrom, gridTo;               // crafting grid slots [from, to)
-        final int invFrom, hotbarFrom, invTo;     // main inventory [invFrom, hotbarFrom), hotbar [hotbarFrom, invTo)
-        final int minItems;                       // minimum amount of input the recipe book needs
-        final int[] manualCells;                  // grid cells used by the manual fallback (one stack each)
-        final boolean dropOutput;                 // true: Ctrl+Q the result (slabs), false: shift-click it (planks)
-
-        Spec(String name, Item input, Item output, int gridFrom, int gridTo,
-             int invFrom, int hotbarFrom, int invTo, int minItems, int[] manualCells, boolean dropOutput) {
-            this.name = name;
-            this.input = input;
-            this.output = output;
-            this.gridFrom = gridFrom;
-            this.gridTo = gridTo;
-            this.invFrom = invFrom;
-            this.hotbarFrom = hotbarFrom;
-            this.invTo = invTo;
-            this.minItems = minItems;
-            this.manualCells = manualCells;
-            this.dropOutput = dropOutput;
-        }
-    }
-
-    /*
-     * PlayerScreenHandler:   0 = result, 1-4 = grid, 5-8 armor, 9-35 inventory, 36-44 hotbar, 45 offhand
-     * CraftingScreenHandler: 0 = result, 1-9 = grid, 10-36 inventory, 37-45 hotbar
-     */
-    private static final Spec SPEC_PLANKS = new Spec("planks",
-        Items.SPRUCE_LOG, Items.SPRUCE_PLANKS, 1, 5, 9, 36, 45, 1, new int[] {1}, false);
-
-    private static final Spec SPEC_SLABS = new Spec("slabs",
-        Items.SPRUCE_PLANKS, Items.SPRUCE_SLAB, 1, 10, 10, 37, 46, 3, new int[] {7, 8, 9}, true);
-
-    private static final int T_INV_FROM = 10;
-    private static final int T_INV_TO   = 46;
-
-    private static final int PENDING_NONE  = 0;
-    private static final int PENDING_FILL  = 1;
-    private static final int PENDING_CRAFT = 2;
+    private enum Mode { SPRUCE, BUCKET }
 
     private static KeyBinding startKey;
+    private static KeyBinding bucketKey;
 
     private static Phase phase = Phase.IDLE;
     private static int cooldown = 0;
@@ -221,6 +148,13 @@ public class SpruceFastClient implements ClientModInitializer {
     private static String pendingChat = null;
 
     private static volatile boolean orderFilled = false;
+
+    private static Mode mode = Mode.SPRUCE;
+    private static Item jobItem = Items.SPRUCE_LOG;       // what we order / collect
+    private static String jobSearch = "Spruce logs";      // text typed in the search box
+    private static int jobAmount = 576;
+    private static int jobPrice = 53;
+    private static int sellAttempts = 0;
 
     private static int collectedTotal = 0;
     private static int logsAtCollectStart = 0;
@@ -235,29 +169,22 @@ public class SpruceFastClient implements ClientModInitializer {
     private static boolean confirmedSell = false;
 
     private static int tableRetries = 0;
+    private static int noProgress = 0;
+    private static int gridReturns = 0;
     private static int tableAimStage = 0;
     private static boolean droppedAny = false;
     private static int tableSeenSync = -1;
     private static int tableReadyAt = 0;
-    private static int craftReadyAt = 0;
     private static int tableCloses = 0;
     private static int foreignCount = 0;
-    private static int stageRounds = 0;
     private static final ArrayDeque<Runnable> clickQueue = new ArrayDeque<>();
+    private static int lastGridPlanks = -1;
+    private static boolean recipeBookFailed = false;
+    private static boolean lastWasFill = false;
+    private static int recipeFillStreak = 0;
+    private static final Map<Item, NetworkRecipeId> recipeCache = new HashMap<>();
     private static int pickupLastCount = -1;
     private static int pickupStable = 0;
-
-    // recipe-book crafting state (reset for every crafting screen)
-    private static int pendingKind = PENDING_NONE;
-    private static int pendingSince = 0;
-    private static int gridBeforeCraft = -1;
-    private static int fillFails = 0;
-    private static int craftStalls = 0;
-    private static int stableTicks = 0;
-    private static int recipeMissSince = -1;
-    private static String failReason = "";
-    private static final Map<Item, NetworkRecipeId> recipeCache = new HashMap<>();
-    private static final Set<Item> recipeFailed = new HashSet<>(); // items whose recipe-book fill does not work here
 
     // farm layout (resolved in start())
     private static BlockPos tablePos = null;
@@ -272,13 +199,14 @@ public class SpruceFastClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
 
+        KeyBinding.Category category = KeyBinding.Category.create(Identifier.of("spruce_fast", "main"));
+
         startKey = KeyBindingHelper.registerKeyBinding(
-            new KeyBinding(
-                "key.spruce_fast.start",
-                InputUtil.Type.KEYSYM,
-                GLFW.GLFW_KEY_BACKSPACE,
-                KeyBinding.Category.create(Identifier.of("spruce_fast", "main"))
-            )
+            new KeyBinding("key.spruce_fast.start", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_BACKSPACE, category)
+        );
+
+        bucketKey = KeyBindingHelper.registerKeyBinding(
+            new KeyBinding("key.spruce_fast.bucket", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_DELETE, category)
         );
 
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
@@ -301,7 +229,18 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
             if (phase == Phase.IDLE) {
-                start(c);
+                startSpruce(c);
+            } else {
+                stop(c, "Stopped.");
+            }
+        }
+
+        while (bucketKey.wasPressed()) {
+            if (c.player == null) {
+                return;
+            }
+            if (phase == Phase.IDLE) {
+                startBucket(c);
             } else {
                 stop(c, "Stopped.");
             }
@@ -318,10 +257,6 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tickCounter++;
         phaseTicks++;
-
-        if (tickCounter - lastDiscordUpdateTick >= 300) {
-            postDiscordProfit();
-        }
 
         if (pendingChat != null) {
             c.player.networkHandler.sendChatMessage(pendingChat);
@@ -340,18 +275,22 @@ public class SpruceFastClient implements ClientModInitializer {
             case ORDER_WAIT   -> orderWait(c);
             case COLLECT_CMD  -> collectCmd(c);
             case COLLECT_GUI  -> collectGui(c);
-            case PLANKS       -> planks(c);
             case TABLE_OPEN   -> tableOpen(c);
             case TABLE        -> table(c);
             case GO_DROP      -> goDrop(c);
             case PICKUP_WAIT  -> pickupWait(c);
             case SELL_CMD     -> sellCmd(c);
             case SELL_GUI     -> sellGui(c);
+            case B_DISP_OPEN  -> dispOpen(c);
+            case B_DISP_GUI   -> dispGui(c);
+            case B_SELL_FIND  -> bucketSellFind(c);
+            case B_SELL_CMD   -> bucketSellCmd(c);
+            case B_SELL_DIALOG -> bucketSellDialog(c);
             default -> { }
         }
     }
 
-    private static void start(MinecraftClient c) {
+    private static void startSpruce(MinecraftClient c) {
 
         if (countEmptySlots(c) < REQUIRED_FREE_SLOTS) {
             info(c, "Empty your inventory first (need " + REQUIRED_FREE_SLOTS + " free slots).");
@@ -362,26 +301,25 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        mode = Mode.SPRUCE;
+        jobItem = Items.SPRUCE_LOG;
+        jobSearch = ORDER_ITEM_NAME;
+        jobAmount = TARGET_LOGS;
+        jobPrice = PRICE_PER_LOG;
+        sellAttempts = 0;
+
         collectedTotal = 0;
         tableRetries = 0;
         tableCloses = 0;
         foreignCount = 0;
-        stageRounds = 0;
         droppedAny = false;
         tableAimStage = 0;
+        recipeBookFailed = false;
+        lastWasFill = false;
+        recipeFillStreak = 0;
         recipeCache.clear();
-        recipeFailed.clear();
-        resetCraftState();
         pendingChat = null;
-        sellBatchSlabs = 0;
-        sellPayoutReceived = false;
-        sellRevenue = 0.0;
-        completedOrders = 0;
-        profitStartTick = tickCounter;
-        lastDiscordUpdateTick = -999999;
-        discordMessageId = null;
 
-        postDiscordProfit();
         info(c, "ON - ordering " + TARGET_LOGS + " spruce logs @ " + PRICE_PER_LOG);
         setPhase(Phase.ORDER_CMD);
     }
@@ -390,7 +328,6 @@ public class SpruceFastClient implements ClientModInitializer {
         phase = Phase.IDLE;
         releaseKeys(c);
         pendingChat = null;
-        clickQueue.clear();
         if (c.player != null) {
             if (c.currentScreen instanceof HandledScreen<?>) {
                 c.player.closeHandledScreen();
@@ -604,69 +541,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void onChat(String msg) {
 
-        // Order completion detection.
-        if (phase == Phase.ORDER_GUI || phase == Phase.ORDER_WAIT) {
-            if (msg.contains("delivered")
-                    || (msg.contains("order")
-                        && (msg.contains("filled") || msg.contains("completed")
-                            || msg.contains("fulfilled") || msg.contains("ready")
-                            || msg.contains("collect")))) {
-                orderFilled = true;
-            }
+        if (phase != Phase.ORDER_GUI && phase != Phase.ORDER_WAIT) {
+            return;
         }
 
-        // When /sell pays us, DonutSMP normally puts a dollar amount in the chat.
-        // We only accept it while we are actually selling, preventing unrelated
-        // money messages from being counted.
-        if ((phase == Phase.SELL_GUI || phase == Phase.PICKUP_WAIT) && !sellPayoutReceived) {
-            Double payout = extractSellPayout(msg);
-            if (payout != null && payout > 0) {
-                sellRevenue += payout;
-                sellPayoutReceived = true;
-                postDiscordProfit();
-            }
+        // "<player> delivered you ..." or "Your <item> order ... filled/completed/ready"
+        if (msg.contains("delivered")
+                || (msg.contains("order")
+                    && (msg.contains("filled") || msg.contains("completed")
+                        || msg.contains("fulfilled") || msg.contains("ready")
+                        || msg.contains("collect")))) {
+            orderFilled = true;
         }
-    }
-
-    private static Double extractSellPayout(String msg) {
-        String lower = msg.toLowerCase();
-
-        // Only parse messages that look like a /sell result.
-        if (!(lower.contains("sold")
-                || lower.contains("sell")
-                || lower.contains("earned")
-                || lower.contains("received")
-                || lower.contains("made")
-                || lower.contains("profit"))) {
-            return null;
-        }
-
-        Pattern p = Pattern.compile(
-                "(?:\\$\\s*)?([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kmb])?",
-                Pattern.CASE_INSENSITIVE
-        );
-        Matcher m = p.matcher(lower);
-
-        Double best = null;
-        while (m.find()) {
-            try {
-                double value = Double.parseDouble(m.group(1).replace(",", ""));
-                String suffix = m.group(2);
-                if (suffix != null) {
-                    switch (suffix.toLowerCase()) {
-                        case "k" -> value *= 1_000.0;
-                        case "m" -> value *= 1_000_000.0;
-                        case "b" -> value *= 1_000_000_000.0;
-                    }
-                }
-                if (best == null || value > best) {
-                    best = value;
-                }
-            } catch (Exception ignored) {
-            }
-        }
-
-        return best;
     }
 
     /* ======================================================== */
@@ -722,7 +608,7 @@ public class SpruceFastClient implements ClientModInitializer {
             int s = find(h, cs, "new order");
 
             if (s == -1 && title.contains("your orders") && !h.getSlot(0).getStack().isEmpty()
-                    && !h.getSlot(0).getStack().isOf(Items.SPRUCE_LOG)) {
+                    && !h.getSlot(0).getStack().isOf(jobItem)) {
                 s = 0; // "New Order" is the first slot
             }
 
@@ -750,9 +636,6 @@ public class SpruceFastClient implements ClientModInitializer {
                     c.setScreen(null);
                 }
                 info(c, "Order created. Collecting...");
-                completedOrders++;
-                if (profitStartTick < 0) profitStartTick = tickCounter;
-                postDiscordProfit();
                 setPhase(Phase.COLLECT_CMD);
             }
             return;
@@ -800,17 +683,17 @@ public class SpruceFastClient implements ClientModInitializer {
 
         } else if (tf != null && (b = button(ws, "review order")) != null) {
 
-            tf.setText(String.valueOf(PRICE_PER_LOG));
+            tf.setText(String.valueOf(jobPrice));
             pressButton(b);
 
         } else if (tf != null && (b = button(ws, "next")) != null) {
 
-            tf.setText(String.valueOf(TARGET_LOGS));
+            tf.setText(String.valueOf(jobAmount));
             pressButton(b);
 
         } else if (tf != null && title.contains("result")) {
 
-            b = spruceLogButton(ws);
+            b = jobResultButton(ws);
             if (b == null) {
                 return;
             }
@@ -818,7 +701,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         } else if (tf != null && (b = button(ws, "search")) != null) {
 
-            tf.setText(ORDER_ITEM_NAME);
+            tf.setText(jobSearch);
             pressButton(b);
 
         } else {
@@ -830,7 +713,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void orderWait(MinecraftClient c) {
 
-        if (orderFilled) {
+        if (orderFilled && (mode == Mode.SPRUCE || phaseTicks >= 40)) {
             setPhase(Phase.COLLECT_CMD);
             return;
         }
@@ -844,7 +727,7 @@ public class SpruceFastClient implements ClientModInitializer {
             info(c, "Waiting for order... " + (phaseTicks / 20) + "s");
         }
 
-        if (phaseTicks > 0 && phaseTicks % POLL_TICKS == 0) {
+        if (phaseTicks > 0 && phaseTicks % (mode == Mode.BUCKET ? ORDER_POLL_BUCKET : POLL_TICKS) == 0) {
             setPhase(Phase.COLLECT_CMD);
         }
     }
@@ -854,7 +737,7 @@ public class SpruceFastClient implements ClientModInitializer {
     /* ======================================================== */
 
     private static void collectCmd(MinecraftClient c) {
-        logsAtCollectStart = count(c, Items.SPRUCE_LOG);
+        logsAtCollectStart = count(c, jobItem);
         movedAny = false;
         orderFilled = false;
         c.player.networkHandler.sendChatCommand(ORDER_COMMAND);
@@ -870,9 +753,9 @@ public class SpruceFastClient implements ClientModInitializer {
      */
     private static void collectGui(MinecraftClient c) {
 
-        int gained = count(c, Items.SPRUCE_LOG) - logsAtCollectStart;
+        int gained = count(c, jobItem) - logsAtCollectStart;
 
-        if (gained >= TARGET_LOGS - collectedTotal) {
+        if (gained >= jobAmount - collectedTotal) {
             finishCollect(c, gained);
             return;
         }
@@ -906,10 +789,10 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (title.contains("collect items")) {
 
-            if (quickMoveAllNow(c, h, 0, cs, Items.SPRUCE_LOG)) {
+            if (quickMoveAllNow(c, h, 0, cs, jobItem)) {
                 movedAny = true;
             } else if (movedAny) {
-                finishCollect(c, count(c, Items.SPRUCE_LOG) - logsAtCollectStart);
+                finishCollect(c, count(c, jobItem) - logsAtCollectStart);
             }
 
             return;
@@ -920,7 +803,14 @@ public class SpruceFastClient implements ClientModInitializer {
         if (title.contains("edit order")) {
             s = find(h, cs, "collect");
         } else if (title.contains("your orders")) {
-            s = findItem(h, cs, Items.SPRUCE_LOG);
+            s = findItem(h, cs, jobItem);
+            // bucket orders: only claim once EVERYTHING has been delivered
+            if (s != -1 && mode == Mode.BUCKET && !fullyDelivered(h.getSlot(s).getStack())) {
+                closeScreens(c);
+                info(c, "Order not complete yet - waiting...");
+                setPhase(Phase.ORDER_WAIT);
+                return;
+            }
         } else {
             s = find(h, cs, "your orders");
         }
@@ -933,119 +823,35 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void finishCollect(MinecraftClient c, int gained) {
         collectedTotal += Math.max(gained, 0);
         closeScreens(c);
-        info(c, "Collected " + collectedTotal + "/" + TARGET_LOGS + " logs.");
-        stageRounds = 0;
+        info(c, "Collected " + collectedTotal + "/" + jobAmount + ".");
+
+        if (mode == Mode.BUCKET) {
+            beginDispensers(c, false);
+            return;
+        }
+
         tableAimStage = 0;
-        setPhase(Phase.PLANKS);   // logs -> planks in the player inventory first
-        cooldown = 4;
+        setPhase(Phase.TABLE_OPEN);
+        cooldown = 6;
     }
 
     /* ======================================================== */
-    /*                  STAGE 1: LOGS -> PLANKS                 */
-    /*        (player inventory, 2x2 grid, recipe book)         */
+    /*       CRAFTING TABLE (stand on deepslate, throw slabs)   */
     /* ======================================================== */
 
-    /**
-     * Opens the player inventory (like pressing E), then repeats
-     *   recipe book click "Spruce Planks" (server moves one log stack into the grid)
-     *   -> shift-click the result (server crafts everything and puts the planks into the inventory)
-     * until the logs are gone or the inventory has to be emptied first (then the table stage runs).
+    /*
+     * CraftingScreenHandler slots:
+     *   0 = result, 1-9 = grid, 10-36 = inventory, 37-45 = hotbar
      */
-    private static void planks(MinecraftClient c) {
-
-        if (phaseTicks > 3000) {
-            stop(c, "Making planks timed out.");
-            return;
-        }
-
-        // Nothing to convert -> straight to the table.
-        if (count(c, Items.SPRUCE_LOG) == 0) {
-            closeScreens(c);
-            tableAimStage = 0;
-            setPhase(Phase.TABLE_OPEN);
-            return;
-        }
-
-        // Open the player inventory (E).
-        if (!(c.currentScreen instanceof InventoryScreen)) {
-
-            if (c.currentScreen != null) {
-                closeScreens(c);
-                if (c.currentScreen != null) {
-                    c.setScreen(null);
-                }
-                cooldown = 2;
-                return;
-            }
-
-            c.setScreen(new InventoryScreen(c.player));
-            resetCraftState();
-            craftReadyAt = tickCounter + INV_OPEN_WAIT;
-            dumpTable(c.player.playerScreenHandler, "inventory opened");
-            return;
-        }
-
-        PlayerScreenHandler h = c.player.playerScreenHandler;
-
-        if (c.player.currentScreenHandler != h) {
-            return;
-        }
-
-        if (tickCounter < craftReadyAt) {
-            return;
-        }
-
-        if (runQueue()) {
-            return;
-        }
-
-        CraftState r = craftTick(c, h, SPEC_PLANKS);
-
-        if (r == CraftState.FAILED) {
-            stop(c, failReason);
-            return;
-        }
-
-        if (r == CraftState.DONE) {
-
-            closeScreens(c);   // closing returns anything left in the 2x2 grid to the inventory
-
-            if (count(c, Items.SPRUCE_LOG) > 0 && count(c, Items.SPRUCE_PLANKS) < 3) {
-                stop(c, "Inventory too full to craft planks. Free up more slots.");
-                return;
-            }
-
-            tableAimStage = 0;
-            setPhase(Phase.TABLE_OPEN);
-            cooldown = 1;
-        }
-    }
-
-    /** Back to the planks stage (counted, so a planks <-> slabs loop can't run forever). */
-    private static void toPlanks(MinecraftClient c) {
-        if (++stageRounds > MAX_STAGE_ROUNDS) {
-            stop(c, "Crafting keeps switching between planks and slabs. Check logs/latest.log.");
-            return;
-        }
-        tableAimStage = 0;
-        setPhase(Phase.PLANKS);
-    }
-
-    /* ======================================================== */
-    /*     STAGE 2: PLANKS -> SLABS (crafting table, throw)     */
-    /* ======================================================== */
+    private static final int T_INV_FROM = 10;
+    private static final int T_INV_TO   = 46;
 
     private static void tableOpen(MinecraftClient c) {
 
-        int logs = count(c, Items.SPRUCE_LOG);
-        int planksLeft = count(c, Items.SPRUCE_PLANKS);
-
-        // Not enough planks for a slab craft.
-        if (planksLeft < 3) {
+        // Nothing left to craft -> go sell what is in the inventory / on the ground.
+        if (count(c, Items.SPRUCE_LOG) == 0 && count(c, Items.SPRUCE_PLANKS) < 3) {
             releaseKeys(c);
-            if (logs > 0) {
-                toPlanks(c);     // there are still logs -> make planks first
-            } else if (count(c, Items.SPRUCE_SLAB) > 0 || droppedAny) {
+            if (count(c, Items.SPRUCE_SLAB) > 0 || droppedAny) {
                 setPhase(Phase.GO_DROP);
             } else {
                 afterSell(c);
@@ -1102,16 +908,22 @@ public class SpruceFastClient implements ClientModInitializer {
         c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
         c.player.swingHand(Hand.MAIN_HAND);
 
-        resetCraftState();
+        noProgress = 0;
+        gridReturns = 0;
+        lastGridPlanks = -1;
         tableSeenSync = -1;
         setPhase(Phase.TABLE);
     }
 
     /*
-     * Inside the REAL crafting table (server-side container):
-     *   recipe book click "Spruce Slab" -> the server moves up to 3 stacks of planks into the grid
-     *   Ctrl+Q on the RESULT slot       -> the server crafts and drops every slab straight away
-     *                                      (they never touch the inventory)
+     * Everything happens inside the REAL crafting table (server-side container):
+     *   logs   -> planks  (1 log stack in the grid, shift-click the result -> planks go to the inventory)
+     *   planks -> slabs   (3 plank stacks in the bottom row, Ctrl+Q on the RESULT slot: the server crafts
+     *                      and drops every slab straight away - they never touch the inventory)
+     *
+     * Stacks are moved with hotbar SWAP clicks (no mouse cursor). Clicks are queued and sent
+     * ONE per CLICK_GAP ticks, after a short wait when the table opens, so the server and
+     * anti-cheat see human-like inventory activity.
      */
     private static void table(MinecraftClient c) {
 
@@ -1123,7 +935,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (!(c.player.currentScreenHandler instanceof CraftingScreenHandler h)) {
 
             if (tableSeenSync != -1) {
-                // It was open and now it isn't: something closed it (items in the grid go back to the inventory).
+                // It was open and now it isn't: something closed it (items in the grid go back to the hotbar).
                 tableSeenSync = -1;
                 clickQueue.clear();
                 LOG.warn("Crafting table was CLOSED by the server (or another source). Reopening.");
@@ -1149,14 +961,14 @@ public class SpruceFastClient implements ClientModInitializer {
 
         tableRetries = 0;
 
-        // Fresh table screen -> give the server a moment before touching anything.
+        // Fresh table screen -> give the server time before touching anything.
         if (tableSeenSync != h.syncId) {
             tableSeenSync = h.syncId;
             tableReadyAt = tickCounter + OPEN_WAIT;
             // face the cobblestone so Ctrl+Q throws land on it
             c.player.setYaw(throwYaw);
             c.player.setPitch(throwPitch);
-            resetCraftState();
+            clickQueue.clear();
             dumpTable(h, "table opened");
         }
 
@@ -1164,14 +976,26 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (runQueue()) {
+        // Queued clicks go out one at a time.
+        if (!clickQueue.isEmpty()) {
+            clickQueue.poll().run();
+            cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
+            return;
+        }
+
+        // We never use the cursor, but if something is stuck on it, put it away or drop it.
+        if (!h.getCursorStack().isEmpty()) {
+            if (!putCursorAway(c, h, T_INV_FROM, T_INV_TO)) {
+                c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
+            }
+            cooldown = SETTLE;
             return;
         }
 
         /*
-         * (Safety) Slabs that ended up in the inventory while the inventory is getting full
-         * -> Ctrl+Q (drop the WHOLE stack) on every slab stack. Normally slabs are dropped
-         * straight from the result slot and never get here.
+         * A) (Safety) Slabs that ended up in the inventory and the inventory is getting full
+         *    -> Ctrl+Q (drop the WHOLE stack) on every slab stack. Normally slabs are dropped
+         *    straight from the result slot (see B) and never get here.
          */
         if (countFree(h, T_INV_FROM, T_INV_TO) < 4
                 && countOf(h, Items.SPRUCE_SLAB, T_INV_FROM, T_INV_TO) > 0) {
@@ -1185,69 +1009,16 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        CraftState r = craftTick(c, h, SPEC_SLABS);
-
-        if (r == CraftState.FAILED) {
-            stop(c, failReason);
-            return;
-        }
-
-        if (r == CraftState.DONE) {
-
-            c.player.closeHandledScreen();
-
-            if (count(c, Items.SPRUCE_LOG) > 0) {
-                info(c, "Planks turned into slabs. More logs left - back to planks...");
-                toPlanks(c);
-                cooldown = 2;
-            } else {
-                info(c, "Crafting finished. Walking to the cobblestone to sell...");
-                setPhase(Phase.GO_DROP);
-                cooldown = 3;
-            }
-        }
-    }
-
-    /* ======================================================== */
-    /*            RECIPE-BOOK CRAFTING ENGINE (shared)          */
-    /* ======================================================== */
-
-    private static void resetCraftState() {
-        pendingKind = PENDING_NONE;
-        pendingSince = 0;
-        gridBeforeCraft = -1;
-        fillFails = 0;
-        craftStalls = 0;
-        stableTicks = 0;
-        recipeMissSince = -1;
-        clickQueue.clear();
-    }
-
-    /**
-     * One step of a crafting stage on ANY crafting handler (player 2x2 or crafting table 3x3).
-     * Call once per tick; returns WORKING while there is something to do or to wait for,
-     * DONE once the input is used up and everything is settled, FAILED (see failReason) otherwise.
-     *
-     *   grid has input  -> take the output (shift-click for planks, Ctrl+Q for slabs) and wait until
-     *                      the grid is empty (server confirmed) - never a blind fixed delay
-     *   grid is empty   -> recipe book click (craft all) and wait until the grid is filled
-     *                      (if the recipe book can't be used: manual loading as a fallback)
-     */
-    private static CraftState craftTick(MinecraftClient c, ScreenHandler h, Spec s) {
-
-        // 0) We never use the cursor (except in the manual fallback); if something is stuck on it, put it away.
-        if (!h.getCursorStack().isEmpty()) {
-            if (!putCursorAway(c, h, s.invFrom, s.invTo)) {
-                c.interactionManager.clickSlot(h.syncId, -999, 0, SlotActionType.PICKUP, c.player);
-            }
-            cooldown = CLICK_GAP;
-            return CraftState.WORKING;
-        }
-
-        // 1) Look at the grid.
+        /*
+         * B) Something in the grid -> craft it.
+         *      logs   : shift-click the result (planks go into the inventory)
+         *      planks : Ctrl+Q on the result slot (slabs are crafted and DROPPED directly)
+         */
         int gridCount = 0;
+        boolean gridHas = false;
+        boolean gridHasPlanks = false;
 
-        for (int i = s.gridFrom; i < s.gridTo; i++) {
+        for (int i = 1; i <= 9; i++) {
 
             ItemStack st = h.getSlot(i).getStack();
 
@@ -1255,7 +1026,7 @@ public class SpruceFastClient implements ClientModInitializer {
                 continue;
             }
 
-            if (!st.isOf(s.input)) {
+            if (!st.isOf(Items.SPRUCE_PLANKS) && !st.isOf(Items.SPRUCE_LOG)) {
 
                 // A foreign item: report it, send it back to the inventory and carry on.
                 String name = st.getName().getString() + " x" + st.getCount() + " (grid slot " + i + ")";
@@ -1263,168 +1034,153 @@ public class SpruceFastClient implements ClientModInitializer {
                 dumpTable(h, "foreign item");
 
                 if (++foreignCount > 5) {
-                    failReason = "Unexpected item in the crafting grid: " + name;
-                    return CraftState.FAILED;
+                    stop(c, "Unexpected item in the crafting grid: " + name);
+                    return;
                 }
 
                 info(c, "Moving unexpected item out of the grid: " + name);
                 q(c, h, i, 0, SlotActionType.QUICK_MOVE);
-                return CraftState.WORKING;
+                return;
             }
 
+            gridHas = true;
             gridCount += st.getCount();
+
+            if (st.isOf(Items.SPRUCE_PLANKS)) {
+                gridHasPlanks = true;
+            }
         }
 
-        /* ---------------- grid has ingredients -> craft ---------------- */
-        if (gridCount > 0) {
+        if (gridHas) {
 
-            stableTicks = 0;
+            lastWasFill = false;   // the grid is filled, so the last fill (if any) worked
+            recipeFillStreak = 0;
 
-            if (pendingKind == PENDING_FILL) {
-                pendingKind = PENDING_NONE;   // the server filled the grid
-                fillFails = 0;
-            }
+            if (lastGridPlanks == -1) {
+                lastGridPlanks = gridCount;
+            } else if (gridCount < lastGridPlanks) {
+                lastGridPlanks = gridCount;      // progress
+                noProgress = 0;
+                gridReturns = 0;
+            } else if (++noProgress >= 4) {
 
-            if (pendingKind == PENDING_CRAFT) {
+                dumpTable(h, "no crafting progress");
 
-                if (tickCounter - pendingSince < CRAFT_TIMEOUT) {
-                    return CraftState.WORKING;   // the server is still working on our last click
+                if (++gridReturns > 3) {
+                    stop(c, "Crafting makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.");
+                    return;
                 }
 
-                pendingKind = PENDING_NONE;
-
-                if (gridBeforeCraft >= 0 && gridCount < gridBeforeCraft) {
-                    craftStalls = 0;             // partial progress (e.g. inventory was full), go on
-                } else if (++craftStalls >= 3) {
-                    dumpTable(h, "no crafting progress");
-                    failReason = "Crafting " + s.name + " makes no progress (inventory full, or the server isn't crafting). Check logs/latest.log.";
-                    return CraftState.FAILED;
+                // give the grid contents back to the inventory and try again
+                for (int i = 1; i <= 9; i++) {
+                    if (!h.getSlot(i).getStack().isEmpty()) {
+                        q(c, h, i, 0, SlotActionType.QUICK_MOVE);
+                    }
                 }
+
+                noProgress = 0;
+                lastGridPlanks = -1;
+                return;
             }
 
-            gridBeforeCraft = gridCount;
-
-            if (s.dropOutput) {
-                // Ctrl+Q on the result slot: the server crafts and drops slab after slab until the grid is used up.
+            if (gridHasPlanks) {
+                // Ctrl+Q on the result slot: the server crafts and drops slab after slab until
+                // the planks in the grid are used up. Nothing goes through the inventory.
                 c.interactionManager.clickSlot(h.syncId, 0, 1, SlotActionType.THROW, c.player);
                 droppedAny = true;
             } else {
-                // Shift-click on the result slot: the server crafts everything and moves the planks into the inventory.
                 click(c, h, 0, SlotActionType.QUICK_MOVE);
             }
 
-            pendingKind = PENDING_CRAFT;
-            pendingSince = tickCounter;
-            cooldown = CRAFT_MIN_WAIT;
-            return CraftState.WORKING;
+            cooldown = SETTLE;
+            return;
         }
 
-        /* ---------------- grid is empty ---------------- */
-
-        if (pendingKind == PENDING_CRAFT) {
-            pendingKind = PENDING_NONE;      // the whole grid was crafted
-            craftStalls = 0;
-            gridBeforeCraft = -1;
+        if (lastGridPlanks != -1) {
+            gridReturns = 0; // grid went empty = it was crafted
         }
 
-        if (pendingKind == PENDING_FILL) {
+        lastGridPlanks = -1;
+        noProgress = 0;
 
-            if (tickCounter - pendingSince < FILL_TIMEOUT) {
-                return CraftState.WORKING;   // wait for the server to fill the grid
+        /*
+         * C) Grid empty -> load the next thing, or finish.
+         */
+        boolean recipeOk = USE_RECIPE_BOOK && !recipeBookFailed;
+        boolean haveLogs = findIn(h, Items.SPRUCE_LOG, T_INV_FROM, T_INV_TO) != -1;
+        int planksStacks = stacksOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+        int planksTotal = countOf(h, Items.SPRUCE_PLANKS, T_INV_FROM, T_INV_TO);
+        // the recipe book spreads any amount of planks over the 3 cells; manual loading needs 3 stacks
+        boolean havePlanks = recipeOk ? planksTotal >= 3 : planksStacks >= 3;
+        int freeNow = countFree(h, T_INV_FROM, T_INV_TO);
+
+        // logs first (ONE stack in the top-left cell) - unless the inventory is getting full
+        // of planks, then turn planks into slabs (and drop them) to make room first.
+        if (haveLogs && (freeNow >= 5 || !havePlanks)) {
+            if (!recipeFill(c, h, Items.SPRUCE_PLANKS)) {
+                queueLoad(c, h, Items.SPRUCE_LOG, new int[] {1});
             }
+            return;
+        }
 
-            pendingKind = PENDING_NONE;
-            recipeCache.remove(s.output);    // maybe the cached id is stale: look it up again next time
-
-            if (++fillFails >= 3) {
-                recipeFailed.add(s.output);
-                LOG.warn("Recipe book fill for {} did nothing {} times - switching to manual loading.", s.name, fillFails);
-                info(c, "Recipe book not working for " + s.name + " - loading the grid by hand.");
+        // planks -> slabs
+        if (havePlanks) {
+            if (recipeFill(c, h, Items.SPRUCE_SLAB)) {
+                return;
+            }
+            if (planksStacks >= 3) {
+                queueLoad(c, h, Items.SPRUCE_PLANKS, new int[] {7, 8, 9});   // three stacks side by side
+                return;
             }
         }
 
-        boolean recipeOk = USE_RECIPE_BOOK && !recipeFailed.contains(s.output);
-        boolean have = haveIngredients(h, s, recipeOk);
-
-        // Planks go into the inventory: when it is nearly full, let the table turn planks into slabs first.
-        if (have && !s.dropOutput && countFree(h, s.invFrom, s.invTo) < PLANKS_MIN_FREE) {
-            have = false;
-        }
-
-        /* ---------------- nothing (more) to load -> finish ---------------- */
-        if (!have) {
-            // Wait a few quiet ticks so every server answer has arrived before we move on.
-            if (++stableTicks < 3) {
-                return CraftState.WORKING;
-            }
-            stableTicks = 0;
-            return CraftState.DONE;
-        }
-
-        stableTicks = 0;
-
-        /* ---------------- load via the recipe book ---------------- */
-        if (recipeOk) {
-
-            NetworkRecipeId id = lookupRecipe(c, s.output);
-
-            if (id != null) {
-                recipeMissSince = -1;
-                // true = "craft all" (like shift-clicking the recipe): the server fills the grid with as much as fits
-                c.interactionManager.clickRecipe(h.syncId, id, true);
-                pendingKind = PENDING_FILL;
-                pendingSince = tickCounter;
-                cooldown = FILL_MIN_WAIT;
-                return CraftState.WORKING;
-            }
-
-            // Not in the recipe book (yet). Recipes are unlocked by the server a moment after we get the
-            // ingredients, so wait a little before giving up on the recipe book for this item.
-            if (recipeMissSince < 0) {
-                recipeMissSince = tickCounter;
-            }
-
-            if (tickCounter - recipeMissSince < RECIPE_WAIT) {
-                return CraftState.WORKING;
-            }
-
-            recipeFailed.add(s.output);
-            LOG.warn("No recipe for {} in the recipe book (not unlocked?) - switching to manual loading.", s.name);
-            info(c, "Recipe for " + s.name + " not in the recipe book - loading the grid by hand.");
-        }
-
-        /* ---------------- manual fallback ---------------- */
-        if (stacksOf(h, s.input, s.invFrom, s.invTo) >= s.manualCells.length) {
-            queueLoad(c, h, s.input, s.manualCells, s.invFrom, s.hotbarFrom, s.invTo);
-            return CraftState.WORKING;
-        }
-
-        return CraftState.DONE;   // can't load the grid at all (e.g. not enough full stacks for manual loading)
+        // nothing left to craft -> walk to the cobblestone and sell
+        c.player.closeHandledScreen();
+        info(c, "Crafting finished. Walking to the cobblestone to sell...");
+        setPhase(Phase.GO_DROP);
+        cooldown = 3;
     }
 
-    private static boolean haveIngredients(ScreenHandler h, Spec s, boolean recipeOk) {
-        if (recipeOk) {
-            // the recipe book spreads any amount over the cells
-            return countOf(h, s.input, s.invFrom, s.invTo) >= s.minItems;
-        }
-        return stacksOf(h, s.input, s.invFrom, s.invTo) >= s.manualCells.length;
-    }
+    /* ---------- recipe book: fill the whole grid with ONE click ---------- */
 
-    private static NetworkRecipeId lookupRecipe(MinecraftClient c, Item result) {
+    /**
+     * Presses the recipe in the recipe book with "craft all" (like shift-clicking it): the server
+     * moves the ingredients from the inventory into the grid itself. Returns false if the recipe
+     * book can't be used (then the caller loads the grid by hand).
+     */
+    private static boolean recipeFill(MinecraftClient c, ScreenHandler h, Item result) {
+
+        if (!USE_RECIPE_BOOK || recipeBookFailed) {
+            return false;
+        }
+
+        // The last fill didn't put anything in the grid -> after a few tries give up on the recipe book.
+        if (lastWasFill && ++recipeFillStreak >= 3) {
+            recipeBookFailed = true;
+            LOG.warn("Recipe book fill did nothing {} times - switching to manual loading.", recipeFillStreak);
+            info(c, "Recipe book not working here - loading the grid by hand.");
+            return false;
+        }
 
         NetworkRecipeId id = recipeCache.get(result);
 
         if (id == null) {
             id = findRecipe(c, result);
-            if (id != null) {
-                recipeCache.put(result, id);
+            if (id == null) {
+                recipeBookFailed = true;
+                LOG.warn("No recipe for {} in the recipe book (not unlocked?) - switching to manual loading.", result);
+                info(c, "Recipe not in the recipe book - loading the grid by hand.");
+                return false;
             }
+            recipeCache.put(result, id);
         }
 
-        return id;
+        c.interactionManager.clickRecipe(h.syncId, id, true);   // true = craft all (fill the grid with as much as possible)
+        lastWasFill = true;
+        cooldown = SETTLE * 2;                                  // wait for the server to fill the grid
+        return true;
     }
 
-    /** Looks the recipe up in the player's REAL recipe book (only unlocked recipes are in there). */
     private static NetworkRecipeId findRecipe(MinecraftClient c, Item result) {
 
         var ctx = SlotDisplayContexts.createParameters(c.world);
@@ -1442,16 +1198,6 @@ public class SpruceFastClient implements ClientModInitializer {
         return null;
     }
 
-    /** Runs ONE queued click (manual fallback / safety clicks). Returns true if it did something. */
-    private static boolean runQueue() {
-        if (clickQueue.isEmpty()) {
-            return false;
-        }
-        clickQueue.poll().run();
-        cooldown = clickQueue.isEmpty() ? SETTLE : CLICK_GAP;
-        return true;
-    }
-
     /** Queues one click; it is sent later, one per CLICK_GAP ticks. */
     private static void q(MinecraftClient c, ScreenHandler h, int slot, int button, SlotActionType type) {
         clickQueue.add(() -> {
@@ -1464,46 +1210,45 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /*
-     * MANUAL FALLBACK (only used if the recipe book can't be used for an item):
-     * queues "move one whole stack of `item` into each of the given cells". Stacks already in the
-     * hotbar are swapped straight into the cell; the others are picked up and put into the cell.
+     * Queues "move one whole stack of `item` into each of the given cells" without the cursor:
+     * stacks already in the hotbar are swapped straight into the cell; others are first swapped
+     * into a free hotbar slot (an EMPTY one if possible, so nothing foreign can end up in the grid).
      */
-    private static void queueLoad(MinecraftClient c, ScreenHandler h, Item item, int[] cells,
-                                  int invFrom, int hotbarFrom, int invTo) {
+    private static void queueLoad(MinecraftClient c, ScreenHandler h, Item item, int[] cells) {
 
         List<Integer> srcs = new ArrayList<>();
 
-        for (int i = hotbarFrom; i < invTo && srcs.size() < cells.length; i++) {
+        for (int i = 37; i < 46 && srcs.size() < cells.length; i++) {
             if (h.getSlot(i).getStack().isOf(item)) srcs.add(i);
         }
-        for (int i = invFrom; i < hotbarFrom && srcs.size() < cells.length; i++) {
+        for (int i = 10; i < 37 && srcs.size() < cells.length; i++) {
             if (h.getSlot(i).getStack().isOf(item)) srcs.add(i);
         }
 
         boolean[] hbUsed = new boolean[9];
         for (int src : srcs) {
-            if (src >= hotbarFrom) hbUsed[src - hotbarFrom] = true;
+            if (src >= 37) hbUsed[src - 37] = true;
         }
 
         for (int k = 0; k < srcs.size(); k++) {
 
             int src = srcs.get(k);
 
-            if (src >= hotbarFrom) {
+            if (src >= 37) {
 
                 // already in the hotbar: ONE swap straight into the cell
-                q(c, h, cells[k], src - hotbarFrom, SlotActionType.SWAP);
+                q(c, h, cells[k], src - 37, SlotActionType.SWAP);
 
             } else if (DIRECT_LOAD) {
 
-                // main inventory -> grid cell directly: pick the stack up, put it in the cell
+                // main inventory -> crafting cell directly: pick the stack up, put it in the cell
                 q(c, h, src, 0, SlotActionType.PICKUP);
                 q(c, h, cells[k], 0, SlotActionType.PICKUP);
 
             } else {
 
-                // hotbar stopover (set DIRECT_LOAD = false if the direct way misbehaves)
-                int hb = freeHotbar(h, hbUsed, hotbarFrom);
+                // old way: hotbar stopover (set DIRECT_LOAD = false if the direct way misbehaves)
+                int hb = freeHotbar(h, hbUsed);
                 hbUsed[hb] = true;
                 q(c, h, src, hb, SlotActionType.SWAP);
                 q(c, h, cells[k], hb, SlotActionType.SWAP);
@@ -1511,9 +1256,9 @@ public class SpruceFastClient implements ClientModInitializer {
         }
     }
 
-    private static int freeHotbar(ScreenHandler h, boolean[] used, int hotbarFrom) {
+    private static int freeHotbar(ScreenHandler h, boolean[] used) {
         for (int hb = 0; hb < 9; hb++) {
-            if (!used[hb] && h.getSlot(hotbarFrom + hb).getStack().isEmpty()) return hb;
+            if (!used[hb] && h.getSlot(37 + hb).getStack().isEmpty()) return hb;
         }
         for (int hb = 0; hb < 9; hb++) {
             if (!used[hb]) return hb;
@@ -1525,7 +1270,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (!DEBUG) {
             return;
         }
-        LOG.info("[CRAFT] {} (syncId {})", why, h.syncId);
+        LOG.info("[TABLE] {} (syncId {})", why, h.syncId);
         for (int i = 0; i < h.slots.size(); i++) {
             ItemStack st = h.getSlot(i).getStack();
             if (!st.isEmpty()) {
@@ -1608,17 +1353,18 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void sellCmd(MinecraftClient c) {
 
-        if (count(c, Items.SPRUCE_SLAB) == 0) {
-            enterPickupWait();
+        if (sellableCount(c) == 0) {
+            if (mode == Mode.BUCKET) {
+                afterSell(c);
+            } else {
+                enterPickupWait();
+            }
             return;
         }
 
         movedPlanks = false;
         confirmedSell = false;
-        sellBatchSlabs = count(c, Items.SPRUCE_SLAB);
-        sellPayoutReceived = false;
         c.player.networkHandler.sendChatCommand(SELL_COMMAND);
-        postDiscordProfit();
         setPhase(Phase.SELL_GUI);
     }
 
@@ -1640,8 +1386,13 @@ public class SpruceFastClient implements ClientModInitializer {
 
         // 1) ONE SHOT: shift-click every slab (and leftover plank) stack into the sell GUI at once
         if (!movedPlanks) {
-            quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_SLAB);
-            quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_PLANKS);
+            if (mode == Mode.BUCKET) {
+                quickMoveAllNow(c, h, cs, h.slots.size(), Items.BUCKET);
+                quickMoveAllNow(c, h, cs, h.slots.size(), Items.WATER_BUCKET);
+            } else {
+                quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_SLAB);
+                quickMoveAllNow(c, h, cs, h.slots.size(), Items.SPRUCE_PLANKS);
+            }
             movedPlanks = true;
             cooldown = 3;
             return;
@@ -1664,7 +1415,16 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         cooldown = 10;
-        postDiscordProfit();
+
+        if (mode == Mode.BUCKET) {
+            if (sellableCount(c) > 0 && ++sellAttempts < 3) {
+                setPhase(Phase.SELL_CMD);      // the sell GUI was too small - sell the rest
+            } else {
+                afterSell(c);
+            }
+            return;
+        }
+
         enterPickupWait();
     }
 
@@ -1673,12 +1433,32 @@ public class SpruceFastClient implements ClientModInitializer {
 
         cooldown = 10;
 
-        if (count(c, Items.SPRUCE_LOG) > 0) {
-            toPlanks(c);   // logs first (inventory), then back onto the deepslate block for the table
+        if (mode == Mode.BUCKET) {
+            sellAttempts = 0;
+
+            if (!LOOP) {
+                stop(c, "Done.");
+                return;
+            }
+
+            if (countEmptySlots(c) < BUCKET_MIN_FREE_SLOTS) {
+                stop(c, "Not enough free slots for the next batch.");
+                return;
+            }
+
+            collectedTotal = 0;
+            info(c, "Cycle complete. Ordering the next " + jobAmount + " buckets...");
+            setPhase(Phase.ORDER_CMD);
             return;
         }
 
-        if (collectedTotal >= TARGET_LOGS) {
+        if (count(c, Items.SPRUCE_LOG) > 0) {
+            tableAimStage = 0;
+            setPhase(Phase.TABLE_OPEN);   // walks back onto the deepslate block
+            return;
+        }
+
+        if (collectedTotal >= jobAmount) {
 
             if (!LOOP) {
                 stop(c, "Done.");
@@ -1701,84 +1481,525 @@ public class SpruceFastClient implements ClientModInitializer {
     }
 
     /* ======================================================== */
-    /*                         HELPERS                          */
+    /*       BUCKET MODE: order -> dispensers -> /ah sell       */
     /* ======================================================== */
 
+    private static List<BlockPos> dispensers = new ArrayList<>();
+    private static int[] dispAssign = new int[0];
+    private static int dispIdx = 0;
+    private static boolean dispEmptyMode = false;
+    private static int dispStage = 0;
+    private static boolean dispActed = false;
+    private static int dispRetries = 0;
 
-    /* ======================================================== */
-    /*                    DISCORD WEBHOOK                       */
-    /* ======================================================== */
+    private static int bucketSold = 0;
+    private static int bucketSellTarget = 0;
+    private static int bucketIdle = 0;
+    private static int bucketFail = 0;
 
-    private static void postDiscordProfit() {
-        if (DISCORD_WEBHOOK_URL.startsWith("PASTE_")) {
+    private static volatile long bucketPrice = -1;       // price we list water buckets for
+    private static volatile long lowestMarketPrice = -1; // lowest current water-bucket market price
+    private static volatile long lastPriceFetchMs = 0;
+    private static volatile String priceError = "";
+
+    private static void startBucket(MinecraftClient c) {
+
+        if (countEmptySlots(c) < BUCKET_MIN_FREE_SLOTS) {
+            info(c, "Free up your inventory first (need " + BUCKET_MIN_FREE_SLOTS + " free slots).");
             return;
         }
 
-        lastDiscordUpdateTick = tickCounter;
+        mode = Mode.BUCKET;
+        jobItem = Items.BUCKET;
+        jobSearch = "Bucket";
+        jobAmount = BUCKET_ORDER_AMOUNT;
+        jobPrice = BUCKET_ORDER_PRICE;
 
-        double net = sellRevenue - (completedOrders * ORDER_COST);
-        double hours = Math.max((tickCounter - Math.max(profitStartTick, 0)) / 72000.0, 1.0 / 3600.0);
-        double perHour = net / hours;
+        collectedTotal = 0;
+        sellAttempts = 0;
+        bucketPrice = -1;
+        lowestMarketPrice = -1;
+        lastPriceFetchMs = 0;
+        priceError = "";
+        pendingChat = null;
 
-        String content =
-                "💰 **Spruce Fast Profit**\\n"
-                + "Sell revenue: **$" + money(sellRevenue) + "**\\n"
-                + "Orders: **" + completedOrders + "** × $" + money(ORDER_COST)
-                + " = **$" + money((double) completedOrders * ORDER_COST) + "**\\n"
-                + "NET PROFIT: **$" + money(net) + "**\\n"
-                + "Current rate: **$" + money(perHour) + "/hr**";
+        refreshMarketPrice(c);   // use Market Tracking; it may already have a cached price
+
+        info(c, "BUCKET MODE ON - ordering " + jobAmount + " buckets @ " + jobPrice);
+        setPhase(Phase.ORDER_CMD);
+    }
+
+    /** The "Spruce Log" result button for spruce mode, the plain "Bucket" button for bucket mode. */
+    private static ClickableWidget jobResultButton(List<ClickableWidget> ws) {
+
+        if (mode == Mode.SPRUCE) {
+            return spruceLogButton(ws);
+        }
+
+        for (ClickableWidget w : ws) {
+            if (!(w instanceof PressableWidget)) {
+                continue;
+            }
+            // drop any leading icon character, then it must be exactly "bucket" (not Water Bucket etc.)
+            String t = w.getMessage().getString().trim().toLowerCase(Locale.ROOT).replaceAll("^[^a-z0-9]+", "");
+            if (t.equals("bucket")) {
+                return w;
+            }
+        }
+
+        return null;
+    }
+
+    /** "144/144 Delivered" / "Order Completed" in the order's tooltip. */
+    private static boolean fullyDelivered(ItemStack stack) {
+        String t = textOf(stack);
+        return t.contains(jobAmount + "/" + jobAmount) || t.contains("order completed");
+    }
+
+    private static int sellableCount(MinecraftClient c) {
+        if (mode == Mode.BUCKET) {
+            return count(c, Items.BUCKET) + count(c, Items.WATER_BUCKET);
+        }
+        return count(c, Items.SPRUCE_SLAB);
+    }
+
+    /* ---------- dispensers ---------- */
+
+    private static List<BlockPos> findDispensers(MinecraftClient c) {
+
+        BlockPos base = c.player.getBlockPos();
+        Vec3d eye = c.player.getEyePos();
+        List<BlockPos> found = new ArrayList<>();
+
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = -5; dy <= 5; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+
+                    BlockPos p = base.add(dx, dy, dz);
+
+                    if (c.world.getBlockState(p).isOf(Blocks.DISPENSER)
+                            && eye.distanceTo(Vec3d.ofCenter(p)) <= DISPENSER_REACH) {
+                        found.add(p);
+                    }
+                }
+            }
+        }
+
+        found.sort(Comparator.comparingDouble(p -> eye.squaredDistanceTo(Vec3d.ofCenter(p))));
+
+        return found.size() > MAX_DISPENSERS ? new ArrayList<>(found.subList(0, MAX_DISPENSERS)) : found;
+    }
+
+    private static int bucketStacks(MinecraftClient c) {
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+        int n = 0;
+        for (int i = 9; i <= 45; i++) {
+            if (h.getSlot(i).getStack().isOf(Items.BUCKET)) n++;
+        }
+        return n;
+    }
+
+    /** empty = false: put the empty-bucket stacks into the dispensers. empty = true: take everything out. */
+    private static void beginDispensers(MinecraftClient c, boolean empty) {
+
+        dispEmptyMode = empty;
+
+        if (!empty) {
+
+            dispensers = findDispensers(c);
+
+            if (dispensers.isEmpty()) {
+                stop(c, "No dispenser within reach (" + DISPENSER_REACH + " blocks).");
+                return;
+            }
+
+            // spread the stacks over the dispensers (9 stacks + 9 dispensers = one each)
+            int stacks = bucketStacks(c);
+            dispAssign = new int[dispensers.size()];
+            for (int i = 0; i < stacks; i++) {
+                dispAssign[i % dispensers.size()]++;
+            }
+
+            bucketSellTarget = Math.max(0, jobAmount - STUCK_BUCKETS);
+            LOG.info("Dispensers: {} ({} bucket stacks) sell target {}", dispensers, stacks, bucketSellTarget);
+        }
+
+        dispIdx = 0;
+        dispStage = 0;
+        dispActed = false;
+        dispRetries = 0;
+
+        setPhase(Phase.B_DISP_OPEN);
+        cooldown = empty ? 0 : 4;
+    }
+
+    private static void dispOpen(MinecraftClient c) {
+
+        if (phaseTicks > 200) {
+            stop(c, "Could not open dispenser #" + (dispIdx + 1) + ".");
+            return;
+        }
+
+        if (c.currentScreen instanceof HandledScreen<?>) {
+            closeScreens(c);
+            return;
+        }
+
+        BlockPos pos = dispensers.get(dispIdx);
+
+        if (!c.world.getBlockState(pos).isOf(Blocks.DISPENSER)) {
+            nextDispenser(c);
+            return;
+        }
+
+        Vec3d center = Vec3d.ofCenter(pos);
+
+        // Stage 0: look at it (servers check where we look), stage 1: use it.
+        if (dispStage == 0) {
+            aimAt(c, center);
+            dispStage = 1;
+            cooldown = 3;
+            return;
+        }
+
+        dispStage = 0;
+
+        Vec3d eye = c.player.getEyePos();
+        Vec3d end = eye.add(c.player.getRotationVec(1.0f).multiply(5.0));
+
+        BlockHitResult hit = c.world.raycast(new RaycastContext(
+            eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, c.player));
+
+        if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos)) {
+            Direction side = Direction.getFacing(eye.x - center.x, eye.y - center.y, eye.z - center.z);
+            Vec3d on = center.add(side.getOffsetX() * 0.5, side.getOffsetY() * 0.5, side.getOffsetZ() * 0.5);
+            hit = new BlockHitResult(on, side, pos, false);
+        }
+
+        c.interactionManager.interactBlock(c.player, Hand.MAIN_HAND, hit);
+        c.player.swingHand(Hand.MAIN_HAND);
+
+        dispActed = false;
+        setPhase(Phase.B_DISP_GUI);
+    }
+
+    private static void dispGui(MinecraftClient c) {
+
+        HandledScreen<?> hs = openContainer(c);
+
+        if (hs == null) {
+            if (phaseTicks > 40) {
+                if (++dispRetries > 3) {
+                    stop(c, "Dispenser #" + (dispIdx + 1) + " will not open.");
+                } else {
+                    dispStage = 0;
+                    setPhase(Phase.B_DISP_OPEN);
+                }
+            }
+            return;
+        }
+
+        dump(hs);
+
+        ScreenHandler h = hs.getScreenHandler();
+        int cs = containerSize(h);
+
+        if (!dispActed) {
+
+            if (phaseTicks < 3) {
+                return; // let the contents arrive
+            }
+
+            if (!dispEmptyMode) {
+                // put this dispenser's share of bucket stacks in (shift-click)
+                int left = dispAssign[dispIdx];
+                for (int i = cs; i < h.slots.size() && left > 0; i++) {
+                    if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
+                        click(c, h, i, SlotActionType.QUICK_MOVE);
+                        left--;
+                    }
+                }
+            } else {
+                // take everything out (shift-click every filled dispenser slot)
+                for (int i = 0; i < cs; i++) {
+                    if (!h.getSlot(i).getStack().isEmpty()) {
+                        click(c, h, i, SlotActionType.QUICK_MOVE);
+                    }
+                }
+            }
+
+            dispActed = true;
+            cooldown = 3;
+            return;
+        }
+
+        c.player.closeHandledScreen();
+        dispRetries = 0;
+        nextDispenser(c);
+    }
+
+    private static void nextDispenser(MinecraftClient c) {
+
+        dispIdx++;
+        dispStage = 0;
+        dispActed = false;
+
+        if (dispIdx < dispensers.size()) {
+            setPhase(Phase.B_DISP_OPEN);
+            cooldown = 3;
+            return;
+        }
+
+        if (dispEmptyMode) {
+            info(c, "Dispensers emptied. Selling the leftover buckets with /sell...");
+            sellAttempts = 0;
+            setPhase(Phase.SELL_CMD);
+            cooldown = 5;
+            return;
+        }
+
+        bucketSold = 0;
+        bucketIdle = 0;
+        bucketFail = 0;
+        info(c, "Dispensers loaded. Selling water buckets on the AH...");
+        setPhase(Phase.B_SELL_FIND);
+    }
+
+    /* ---------- selling water buckets: hold -> /ah sell <price> -> Yes ---------- */
+
+    private static int waterBucketSlot(MinecraftClient c) {
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+        for (int i = 36; i <= 44; i++) {
+            if (h.getSlot(i).getStack().isOf(Items.WATER_BUCKET)) return i;   // hotbar first
+        }
+        for (int i = 9; i <= 35; i++) {
+            if (h.getSlot(i).getStack().isOf(Items.WATER_BUCKET)) return i;
+        }
+        return -1;
+    }
+
+    private static void bucketSellFind(MinecraftClient c) {
+
+        if (System.currentTimeMillis() - lastPriceFetchMs > PRICE_REFRESH_MS) {
+            refreshMarketPrice(c);
+        }
+
+        if (bucketPrice < 0) {
+            if (phaseTicks > 400) {
+                stop(c, "No water-bucket price from Market Tracking: "
+                    + (priceError.isEmpty() ? "no price available yet" : priceError));
+            }
+            return;
+        }
+
+        if (bucketSold >= bucketSellTarget) {
+            finishBucketSelling(c);
+            return;
+        }
+
+        int slot = waterBucketSlot(c);
+
+        if (slot == -1) {
+
+            bucketIdle++;
+
+            if (bucketIdle > BUCKET_IDLE_TICKS) {
+                if (bucketSold > 0) {
+                    finishBucketSelling(c);
+                } else {
+                    stop(c, "No water buckets arrived for 90 seconds.");
+                }
+            } else if (bucketIdle % 100 == 0) {
+                info(c, "Sold " + bucketSold + "/" + bucketSellTarget + " - waiting for water buckets...");
+            }
+            return;
+        }
+
+        bucketIdle = 0;
+
+        // Hold it: select its hotbar slot, or swap it into the selected one.
+        var inv = c.player.getInventory();
+
+        if (slot >= 36 && slot <= 44) {
+            inv.setSelectedSlot(slot - 36);
+        } else {
+            c.interactionManager.clickSlot(c.player.playerScreenHandler.syncId, slot,
+                inv.getSelectedSlot(), SlotActionType.SWAP, c.player);
+        }
+
+        cooldown = 1;   // the server learns about the new selected slot on the next tick
+        setPhase(Phase.B_SELL_CMD);
+    }
+
+    private static void bucketSellCmd(MinecraftClient c) {
+
+        if (!c.player.getMainHandStack().isOf(Items.WATER_BUCKET)) {
+            if (++bucketFail > 25) {
+                stop(c, "Cannot hold the water bucket.");
+                return;
+            }
+            setPhase(Phase.B_SELL_FIND);
+            return;
+        }
+
+        c.player.networkHandler.sendChatCommand("ah sell " + bucketPrice);
+
+        dialogScreen = null;
+        lastPressTick = -1000;
+        setPhase(Phase.B_SELL_DIALOG);
+    }
+
+    private static void bucketSellDialog(MinecraftClient c) {
+
+        Screen sc = c.currentScreen;
+
+        // We pressed Yes and the dialog is gone -> listed.
+        if (dialogScreen != null && lastPressTick > -500 && sc != dialogScreen) {
+            bucketSold++;
+            bucketFail = 0;
+            setPhase(Phase.B_SELL_FIND);
+            return;
+        }
+
+        if (sc == null || sc instanceof HandledScreen<?>) {
+            if (phaseTicks > 40) {
+                if (++bucketFail >= 5) {
+                    stop(c, "The /ah sell confirmation never appeared (listing limit? price rejected?). Check the chat.");
+                } else {
+                    setPhase(Phase.B_SELL_FIND);
+                }
+            }
+            return;
+        }
+
+        if (sc != dialogScreen) {
+            dialogScreen = sc;
+            dialogSince = tickCounter;
+            lastPressTick = -1000;
+        }
+
+        if (phaseTicks > 160) {
+            closeScreens(c);
+            if (c.currentScreen != null) {
+                c.setScreen(null);
+            }
+            if (++bucketFail >= 5) {
+                stop(c, "The sell dialog does not close. Check the chat.");
+            } else {
+                setPhase(Phase.B_SELL_FIND);
+            }
+            return;
+        }
+
+        if (tickCounter - lastPressTick < 10) {
+            return; // pressed - wait for the dialog to close
+        }
+
+        ClickableWidget yes = button(widgets(sc), "yes");
+
+        if (yes == null) {
+            return;
+        }
+
+        pressButton(yes);
+        lastPressTick = tickCounter;
+    }
+
+    private static void finishBucketSelling(MinecraftClient c) {
+        info(c, "Sold " + bucketSold + " water buckets. Emptying the dispensers...");
+        beginDispensers(c, true);
+    }
+
+    /* ---------- Market Tracking price source ---------- */
+
+    /**
+     * Refreshes Donut Utilities' Market Tracking cache and reads the current
+     * lowest water-bucket price from PriceApi.
+     *
+     * Example:
+     *   market lowest = 5000
+     *   5000 * 0.98 = 4900
+     *   bucketPrice = 4900
+     *
+     * PriceApi itself controls the network refresh interval and keeps its
+     * previous cache when the price service is temporarily unavailable.
+     */
+    private static void refreshMarketPrice(MinecraftClient c) {
+
+        lastPriceFetchMs = System.currentTimeMillis();
 
         try {
-            if (discordMessageId == null) {
-                String url = DISCORD_WEBHOOK_URL
-                        + (DISCORD_WEBHOOK_URL.contains("?") ? "&wait=true" : "?wait=true");
+            // This is the Market Tracking source. No DonutSMP API key is used here.
+            PriceApi.refreshIfStale(c);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString("{\"content\":\""
-                                + jsonEscape(content) + "\"}"))
-                        .build();
+            PriceApi.Entry waterBucket = null;
 
-                PROFIT_HTTP.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                        .thenAccept(response -> {
-                            Matcher m = Pattern.compile("\"id\"\\s*:\\s*\"([0-9]+)\"").matcher(response.body());
-                            if (m.find()) {
-                                discordMessageId = m.group(1);
-                            }
-                        })
-                        .exceptionally(ex -> null);
-            } else {
-                String base = DISCORD_WEBHOOK_URL;
-                int q = base.indexOf('?');
-                if (q >= 0) base = base.substring(0, q);
+            for (PriceApi.Entry entry : PriceApi.snapshot().values()) {
+                String key = entry.key() == null
+                    ? ""
+                    : entry.key().toLowerCase(Locale.ROOT);
 
-                String url = base + "/messages/" + discordMessageId;
+                String name = entry.name() == null
+                    ? ""
+                    : entry.name().toLowerCase(Locale.ROOT);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Content-Type", "application/json")
-                        .method("PATCH", HttpRequest.BodyPublishers.ofString(
-                                "{\"content\":\"" + jsonEscape(content) + "\"}"))
-                        .build();
-
-                PROFIT_HTTP.sendAsync(request, HttpResponse.BodyHandlers.discarding())
-                        .exceptionally(ex -> null);
+                if (key.equals("water_bucket")
+                        || key.equals("minecraft:water_bucket")
+                        || name.equals("water bucket")
+                        || name.equals("water_bucket")) {
+                    waterBucket = entry;
+                    break;
+                }
             }
-        } catch (Exception ignored) {
+
+            if (waterBucket == null) {
+                throw new IllegalStateException(
+                    "Market Tracking has no water bucket entry"
+                );
+            }
+
+            Long lowest = waterBucket.currentMinPrice();
+
+            if (lowest == null || lowest <= 0L) {
+                throw new IllegalStateException(
+                    "Market Tracking has no current water bucket price"
+                );
+            }
+
+            long sellPrice = (long) Math.floor(lowest * UNDERCUT);
+            sellPrice = Math.max(
+                MIN_LIST_PRICE,
+                Math.min(MAX_LIST_PRICE, sellPrice)
+            );
+
+            lowestMarketPrice = lowest;
+            bucketPrice = sellPrice;
+            priceError = "";
+
+            LOG.info(
+                "[MARKET] Water bucket lowest {} -> listing at {}",
+                lowestMarketPrice,
+                bucketPrice
+            );
+
+            info(c, "Water bucket market: " + lowestMarketPrice
+                + " -> selling at " + bucketPrice);
+
+        } catch (Exception e) {
+            priceError = e.getMessage() == null
+                ? e.toString()
+                : e.getMessage();
+
+            LOG.warn(
+                "[MARKET] Could not read water bucket price: {}",
+                priceError
+            );
         }
     }
 
-    private static String jsonEscape(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\r", "\\r")
-                .replace("\n", "\\n");
-    }
-
-    private static String money(double value) {
-        return String.format(java.util.Locale.US, "%,.0f", value);
-    }
+    /* ======================================================== */
+    /*                         HELPERS                          */
+    /* ======================================================== */
 
     private static void info(MinecraftClient c, String text) {
         if (c.player != null) {
