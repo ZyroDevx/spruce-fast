@@ -80,20 +80,18 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    ORDER_POLL_BUCKET     = 200;   // check the bucket order every 10 s
 
     /* ---------------- TIMING (ticks) ---------------- */
-    private static final int DIALOG_SETTLE = 8;   // a fresh dialog must exist this long before we click
-    private static final int PRESS_RETRY   = 40;  // ticks before re-clicking the same dialog
+    private static final int DIALOG_SETTLE = 6;  // a fresh dialog must exist this long before we click
+    private static final int PRESS_RETRY   = 30; // ticks before re-clicking the same dialog
 
-    /* ---------------- ANTI-SPAM (raise these if you still get kicked) ---------------- */
-    private static final int COMMAND_GAP_TICKS = 40;  // minimum gap between ANY two commands (2 s)
-    private static final int LIST_DELAY_TICKS  = 120; // pause after every /ah listing (6 s)
-    private static final int CLICK_GAP         = 8;   // gap between inventory / dispenser clicks
-    private static final int MENU_CLICK_DELAY  = 15;  // pause after a click in /orders menus
-    private static final int SELL_SYNC_WAIT    = 15;  // wait for server slot update before selling
-    private static final int SLOT_TIMEOUT      = 40;  // give up waiting for a slot change
-
-    /* ---------------- MOVEMENT WHILE SELLING ---------------- */
-    private static final boolean STRAFE_WHILE_SELLING = true;
-    private static final int     STRAFE_TICKS = 80;   // hold D for 4 s, then A for 4 s, and so on
+    /* ---------------- ANTI-SPAM ----------------
+       Everything EXCEPT selling runs fast (original timings).
+       Only the /ah sell loop is slowed to 1 listing per second. */
+    private static final int COMMAND_GAP_TICKS = 30;  // minimum gap between ANY two commands (1.5 s)
+    private static final int LIST_DELAY_TICKS  = 20;  // 1 sell per second (20 ticks)
+    private static final int CLICK_GAP         = 5;   // gap between inventory / dispenser clicks
+    private static final int MENU_CLICK_DELAY  = 10;  // pause after a click in /orders menus
+    private static final int SELL_SYNC_WAIT    = 8;   // wait for server slot update before selling
+    private static final int SLOT_TIMEOUT      = 20;  // give up waiting for a slot change
 
     /* ========================================== */
 
@@ -183,8 +181,6 @@ public class SpruceFastClient implements ClientModInitializer {
         tickCounter++;
         phaseTicks++;
 
-        strafeTick(c);
-
         if (pendingChat != null) {
             c.player.networkHandler.sendChatMessage(pendingChat);
             pendingChat = null;
@@ -239,15 +235,12 @@ public class SpruceFastClient implements ClientModInitializer {
             c.options.forwardKey.setPressed(false);
             c.options.backKey.setPressed(false);
             c.options.jumpKey.setPressed(false);
-            c.options.leftKey.setPressed(false);
-            c.options.rightKey.setPressed(false);
         }
-        strafeKeysDown = false;
     }
 
-    /** Adds up to +1s of randomness so clicks don't look like a metronome. */
+    /** Small randomness so the sell pace isn't a perfect metronome. */
     private static int jitter(int base) {
-        return base + (int) (Math.random() * 20);
+        return base + (int) (Math.random() * 6);
     }
 
     /* ---------- command throttle ---------- */
@@ -262,36 +255,6 @@ public class SpruceFastClient implements ClientModInitializer {
         lastCommandTick = tickCounter;
         c.player.networkHandler.sendChatCommand(cmd);
         return true;
-    }
-
-    /* ---------- strafing (D for 4 s, A for 4 s) while selling on the AH ---------- */
-
-    private static int strafeTicks = 0;
-    private static boolean strafeRight = true;
-    private static boolean strafeKeysDown = false;
-    private static Vec3d strafeOrigin = null;
-
-    private static void strafeTick(MinecraftClient c) {
-
-        boolean selling = phase == Phase.B_SELL_FIND || phase == Phase.B_SELL_CMD || phase == Phase.B_SELL_DIALOG;
-
-        if (!STRAFE_WHILE_SELLING || !selling || c.currentScreen != null) {
-            if (strafeKeysDown) {
-                c.options.leftKey.setPressed(false);
-                c.options.rightKey.setPressed(false);
-                strafeKeysDown = false;
-            }
-            return;
-        }
-
-        if (++strafeTicks >= STRAFE_TICKS) {
-            strafeTicks = 0;
-            strafeRight = !strafeRight;
-        }
-
-        c.options.rightKey.setPressed(strafeRight);
-        c.options.leftKey.setPressed(!strafeRight);
-        strafeKeysDown = true;
     }
 
     /** After selling: walk back to where selling started so the dispensers are in reach again. */
@@ -797,12 +760,13 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int bucketIdle = 0;
     private static int bucketFail = 0;
 
-    /* Anti-spam: tracks an inventory slot we SWAP-clicked and are waiting on.
+    /* Tracks an inventory slot we SWAP-clicked and are waiting on.
        The slot is only clicked ONCE - we wait for the server's slot update
-       (the stack changing) before doing anything else. This stops the
-       duplicate-click spam that was getting the account kicked. */
+       (the stack changing) before acting again, so no duplicate-click spam. */
     private static int pendingInvSlot = -1;
     private static int pendingSince = 0;
+
+    private static Vec3d strafeOrigin = null;
 
 
     private static void startBucket(MinecraftClient c) {
@@ -1083,8 +1047,6 @@ public class SpruceFastClient implements ClientModInitializer {
         bucketFail = 0;
         lastHotbar = -1;
         pendingInvSlot = -1;
-        strafeTicks = 0;
-        strafeRight = true;
         strafeOrigin = new Vec3d(c.player.getX(), c.player.getY(), c.player.getZ());
         info(c, "Dispensers loaded. Selling water buckets on the AH...");
         setPhase(Phase.B_SELL_FIND);
@@ -1163,7 +1125,7 @@ public class SpruceFastClient implements ClientModInitializer {
             c.interactionManager.clickSlot(syncId, invSlot, target, SlotActionType.SWAP, c.player);
             pendingInvSlot = invSlot;
             pendingSince = tickCounter;
-            cooldown = jitter(CLICK_GAP);
+            cooldown = CLICK_GAP;
             return;
         }
 
@@ -1213,7 +1175,7 @@ public class SpruceFastClient implements ClientModInitializer {
             bucketSold++;
             bucketFail = 0;
             setPhase(Phase.B_SELL_FIND);
-            cooldown = jitter(LIST_DELAY_TICKS);   // 6-7 s between listings - no spam kicks
+            cooldown = jitter(LIST_DELAY_TICKS);   // 1 sell per second
             return;
         }
 
