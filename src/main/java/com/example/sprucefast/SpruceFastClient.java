@@ -74,14 +74,14 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    BUCKET_MIN_FREE_SLOTS = 12;    // water buckets don't stack
     private static final int    MAX_DISPENSERS        = 9;     // use the nearest N dispensers
     private static final double DISPENSER_REACH       = 4.3;   // max eye-to-dispenser distance
-    private static final String LIST_PRICE           = "6k";  // water buckets are listed with: /ah sell 6k
+    private static final String LIST_PRICE           = "10k";  // water buckets are listed with: /ah sell 6k
     private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
     /* ---------------- USER SPEED CONFIG ----------------
        Lower values = faster. 20 ticks = 1 second. */
-    private static final int ORDER_SPEED_TICKS             = 2;   // order GUI actions
-    private static final int ORDER_COLLECT_SPEED_TICKS      = 2;   // collect GUI actions
-    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 1;   // delay between bucket -> dispenser clicks
+    private static final int ORDER_SPEED_TICKS             = 4;   // order GUI actions
+    private static final int ORDER_COLLECT_SPEED_TICKS      = 4;   // collect GUI actions
+    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 0.5;   // delay between bucket -> dispenser clicks
     private static final int SELLING_SPEED_TICKS            = 20;  // delay between AH listings
 
     private static final int    ORDER_POLL_BUCKET     = 60;   // check the order every 3 s (60 ticks)
@@ -107,7 +107,7 @@ public class SpruceFastClient implements ClientModInitializer {
         ORDER_CMD, ORDER_GUI, ORDER_WAIT,
         COLLECT_CMD, COLLECT_GUI,
         SELL_CMD, SELL_GUI,
-        B_DISP_OPEN, B_DISP_GUI,
+        B_PREP_INV, B_DISP_OPEN, B_DISP_GUI,
         B_SELL_FIND, B_SELL_CMD, B_SELL_DIALOG, B_RETURN
     }
 
@@ -205,6 +205,7 @@ public class SpruceFastClient implements ClientModInitializer {
             case COLLECT_GUI   -> collectGui(c);
             case SELL_CMD      -> sellCmd(c);
             case SELL_GUI      -> sellGui(c);
+            case B_PREP_INV    -> prepBucketInventory(c);
             case B_DISP_OPEN   -> dispOpen(c);
             case B_DISP_GUI    -> dispGui(c);
             case B_SELL_FIND   -> bucketSellFind(c);
@@ -479,10 +480,8 @@ public class SpruceFastClient implements ClientModInitializer {
 
     private static void orderWait(MinecraftClient c) {
 
-        if (orderFilled && phaseTicks >= 4) {
-            setPhase(Phase.COLLECT_CMD);
-            return;
-        }
+        // Do not assume the order is ready from a chat message. Every 3 seconds
+        // we open /orders and verify the actual delivered amount before collecting.
 
         // The server may re-open the /orders menu after creating the order.
         if (openContainer(c) != null) {
@@ -533,13 +532,9 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         if (phaseTicks > COLLECT_TIMEOUT) {
-            if (gained > 0) {
-                finishCollect(c, gained);
-            } else {
-                closeScreens(c);
-                info(c, "Nothing to collect yet.");
-                setPhase(Phase.ORDER_WAIT);
-            }
+            closeScreens(c);
+            info(c, "Collection check timed out - checking the order again in 3 seconds.");
+            setPhase(Phase.ORDER_WAIT);
             return;
         }
 
@@ -651,8 +646,16 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void finishCollect(MinecraftClient c, int gained) {
         collectedTotal += Math.max(gained, 0);
         closeScreens(c);
-        info(c, "Collected " + collectedTotal + "/" + BUCKET_ORDER_AMOUNT + ".");
-        beginDispensers(c, false);
+
+        int total = count(c, JOB_ITEM);
+        if (total < BUCKET_ORDER_AMOUNT) {
+            info(c, "Only " + total + "/" + BUCKET_ORDER_AMOUNT + " buckets are in the inventory. Checking the order again...");
+            setPhase(Phase.ORDER_WAIT);
+            return;
+        }
+
+        info(c, "Collected " + total + "/" + BUCKET_ORDER_AMOUNT + ". Opening inventory and moving all buckets to the hotbar...");
+        setPhase(Phase.B_PREP_INV);
     }
 
     /* ======================================================== */
@@ -899,7 +902,56 @@ public class SpruceFastClient implements ClientModInitializer {
         dispRetries = 0;
 
         setPhase(Phase.B_DISP_OPEN);
-        cooldown = empty ? 0 : 10;
+        cooldown = empty ? 0 : DISPENSER_BUCKET_SPEED_TICKS;
+    }
+
+    /* Open the player's inventory with E-equivalent behavior and put every
+       empty bucket stack into the 9 hotbar slots before touching dispensers. */
+    private static void prepBucketInventory(MinecraftClient c) {
+
+        if (!(c.currentScreen instanceof InventoryScreen)) {
+            c.setScreen(new InventoryScreen(c.player));
+            cooldown = ORDER_COLLECT_SPEED_TICKS;
+            return;
+        }
+
+        PlayerScreenHandler h = c.player.playerScreenHandler;
+
+        // Fill every hotbar slot with a bucket stack. SWAP moves the previous
+        // hotbar item back into the inventory, so we do not destroy anything.
+        for (int hb = 0; hb < 9; hb++) {
+            if (h.getSlot(36 + hb).getStack().isOf(Items.BUCKET)) {
+                continue;
+            }
+
+            int inv = -1;
+            for (int i = 9; i <= 35; i++) {
+                if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
+                    inv = i;
+                    break;
+                }
+            }
+
+            if (inv == -1) {
+                break;
+            }
+
+            c.interactionManager.clickSlot(h.syncId, inv, hb, SlotActionType.SWAP, c.player);
+            cooldown = ORDER_COLLECT_SPEED_TICKS;
+            return;
+        }
+
+        int stacks = bucketStacks(c);
+        if (stacks < 9) {
+            info(c, "Only " + stacks + "/9 bucket stacks reached the hotbar. Waiting for inventory sync...");
+            cooldown = ORDER_COLLECT_SPEED_TICKS;
+            return;
+        }
+
+        // Keep the inventory visible for a short moment, then close it and
+        // start the dispenser cycle.
+        c.player.closeHandledScreen();
+        beginDispensers(c, false);
     }
 
     private static void dispOpen(MinecraftClient c) {
@@ -927,7 +979,7 @@ public class SpruceFastClient implements ClientModInitializer {
         if (dispStage == 0) {
             aimAt(c, center);
             dispStage = 1;
-            cooldown = 8;
+            cooldown = DISPENSER_BUCKET_SPEED_TICKS;
             return;
         }
 
@@ -991,7 +1043,9 @@ public class SpruceFastClient implements ClientModInitializer {
             if (!dispEmptyMode) {
                 // put this dispenser's share of bucket stacks in (one shift-click at a time)
                 if (dispLeft > 0) {
-                    for (int i = cs; i < h.slots.size(); i++) {
+                    // Buckets were deliberately organized into the hotbar first.
+                    // Only take from hotbar here, so no bucket is left hidden in the main inventory.
+                    for (int i = 36; i <= 44 && i < h.slots.size(); i++) {
                         if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
                             slot = i;
                             break;
@@ -1013,12 +1067,12 @@ public class SpruceFastClient implements ClientModInitializer {
                 if (!dispEmptyMode) {
                     dispLeft--;
                 }
-                cooldown = CLICK_GAP;
+                cooldown = DISPENSER_BUCKET_SPEED_TICKS;
                 return;
             }
 
             dispActed = true;
-            cooldown = 8;
+            cooldown = DISPENSER_BUCKET_SPEED_TICKS;
             return;
         }
 
@@ -1035,7 +1089,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (dispIdx < dispensers.size()) {
             setPhase(Phase.B_DISP_OPEN);
-            cooldown = 12;
+            cooldown = DISPENSER_BUCKET_SPEED_TICKS;
             return;
         }
 
@@ -1164,7 +1218,7 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (!sendCmd(c, "ah sell " + LIST_PRICE)) {
+        if (!sendCmd(c, "ah sell " + LIST_PRICE, SELLING_SPEED_TICKS)) {
             return;   // command throttle - try again next tick
         }
 
@@ -1177,19 +1231,33 @@ public class SpruceFastClient implements ClientModInitializer {
 
         Screen sc = c.currentScreen;
 
-        // We pressed Yes and the dialog is gone -> listed.
-        if (dialogScreen != null && lastPressTick > -500 && sc != dialogScreen) {
-            bucketSold++;
-            bucketFail = 0;
-            setPhase(Phase.B_SELL_FIND);
-            cooldown = jitter(LIST_DELAY_TICKS);   // 1 sell per second
-            return;
-        }
+        /*
+         * The confirmation can be either:
+         *   1) a normal widget dialog, OR
+         *   2) a chest/handled GUI on some server versions.
+         * The old code rejected HandledScreen, which is why a held water
+         * bucket could sit there forever without actually being listed.
+         */
 
-        if (sc == null || sc instanceof HandledScreen<?>) {
-            if (phaseTicks > 40) {
+        if (sc instanceof HandledScreen<?> hs) {
+            ScreenHandler h = hs.getScreenHandler();
+            int cs = containerSize(h);
+
+            int confirm = find(h, cs,
+                    "yes", "confirm", "confirm listing", "sell", "list", "accept");
+
+            if (confirm != -1 && tickCounter - lastPressTick >= 5) {
+                click(c, h, confirm, SlotActionType.PICKUP);
+                lastPressTick = tickCounter;
+                cooldown = SELLING_SPEED_TICKS;
+                return;
+            }
+
+            // Give the handled confirmation GUI time to update before retrying.
+            if (phaseTicks > 160) {
+                closeScreens(c);
                 if (++bucketFail >= 5) {
-                    stop(c, "The /ah sell confirmation never appeared (listing limit? price rejected?). Check the chat.");
+                    stop(c, "The /ah sell confirmation GUI could not be confirmed. Check the chat.");
                 } else {
                     setPhase(Phase.B_SELL_FIND);
                 }
@@ -1197,37 +1265,79 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
-        if (sc != dialogScreen) {
-            dialogScreen = sc;
-            dialogSince = tickCounter;
-            lastPressTick = -1000;
+        if (sc != null) {
+            if (sc != dialogScreen) {
+                dialogScreen = sc;
+                dialogSince = tickCounter;
+                lastPressTick = -1000;
+            }
+
+            if (tickCounter - dialogSince < DIALOG_SETTLE) {
+                return;
+            }
+
+            if (tickCounter - lastPressTick < 5) {
+                return;
+            }
+
+            ClickableWidget yes = sellConfirmButton(widgets(sc));
+            if (yes != null) {
+                pressButton(yes);
+                lastPressTick = tickCounter;
+                cooldown = SELLING_SPEED_TICKS;
+                return;
+            }
+
+            if (phaseTicks > 160) {
+                closeScreens(c);
+                if (++bucketFail >= 5) {
+                    stop(c, "The /ah sell confirmation dialog could not be confirmed. Check the chat.");
+                } else {
+                    setPhase(Phase.B_SELL_FIND);
+                }
+            }
+            return;
         }
 
-        if (phaseTicks > 160) {
-            closeScreens(c);
-            if (c.currentScreen != null) {
-                c.setScreen(null);
-            }
-            if (++bucketFail >= 5) {
-                stop(c, "The sell dialog does not close. Check the chat.");
-            } else {
+        // No screen means the server may have accepted the listing directly.
+        // Do NOT count it as sold immediately. Give the server a few ticks to
+        // update the held slot/inventory; if the water bucket is still there,
+        // retry the sell instead of falsely incrementing bucketSold.
+        if (phaseTicks >= 12) {
+            PlayerScreenHandler h = c.player.playerScreenHandler;
+            int held = 36 + c.player.getInventory().getSelectedSlot();
+            if (!h.getSlot(held).getStack().isOf(Items.WATER_BUCKET)) {
+                bucketSold++;
+                bucketFail = 0;
                 setPhase(Phase.B_SELL_FIND);
+                cooldown = SELLING_SPEED_TICKS;
+            } else {
+                if (++bucketFail >= 5) {
+                    stop(c, "Water bucket is still held after /ah sell. The server did not accept the listing.");
+                } else {
+                    setPhase(Phase.B_SELL_FIND);
+                    cooldown = 2;
+                }
             }
-            return;
         }
+    }
 
-        if (tickCounter - lastPressTick < 10) {
-            return; // pressed - wait for the dialog to close
+    private static ClickableWidget sellConfirmButton(List<ClickableWidget> ws) {
+        for (ClickableWidget w : ws) {
+            if (!(w instanceof PressableWidget)) {
+                continue;
+            }
+            String label = cleanLabel(w.getMessage().getString());
+            if (label.equals("yes")
+                    || label.equals("confirm")
+                    || label.equals("confirm listing")
+                    || label.equals("sell")
+                    || label.equals("list")
+                    || label.equals("accept")) {
+                return w;
+            }
         }
-
-        ClickableWidget yes = button(widgets(sc), "yes");
-
-        if (yes == null) {
-            return;
-        }
-
-        pressButton(yes);
-        lastPressTick = tickCounter;
+        return null;
     }
 
     private static void finishBucketSelling(MinecraftClient c) {
