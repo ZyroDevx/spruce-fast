@@ -77,19 +77,24 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final String LIST_PRICE           = "6k";  // water buckets are listed with: /ah sell 6k
     private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
-    private static final int    ORDER_POLL_BUCKET     = 200;   // check the bucket order every 10 s
+    /* ---------------- USER SPEED CONFIG ----------------
+       Lower values = faster. 20 ticks = 1 second. */
+    private static final int ORDER_SPEED_TICKS             = 2;   // order GUI actions
+    private static final int ORDER_COLLECT_SPEED_TICKS      = 2;   // collect GUI actions
+    private static final int DISPENSER_BUCKET_SPEED_TICKS   = 1;   // delay between bucket -> dispenser clicks
+    private static final int SELLING_SPEED_TICKS            = 20;  // delay between AH listings
+
+    private static final int    ORDER_POLL_BUCKET     = 60;   // check the order every 3 s (60 ticks)
 
     /* ---------------- TIMING (ticks) ---------------- */
     private static final int DIALOG_SETTLE = 6;  // a fresh dialog must exist this long before we click
     private static final int PRESS_RETRY   = 30; // ticks before re-clicking the same dialog
 
     /* ---------------- ANTI-SPAM ----------------
-       Everything EXCEPT selling runs fast (original timings).
-       Only the /ah sell loop is slowed to 1 listing per second. */
+       The four speed values above control the main action delays. */
     private static final int COMMAND_GAP_TICKS = 30;  // minimum gap between ANY two commands (1.5 s)
-    private static final int LIST_DELAY_TICKS  = 20;  // 1 sell per second (20 ticks)
-    private static final int CLICK_GAP         = 5;   // gap between inventory / dispenser clicks
-    private static final int MENU_CLICK_DELAY  = 10;  // pause after a click in /orders menus
+    private static final int LIST_DELAY_TICKS  = SELLING_SPEED_TICKS; // user-configured AH sell delay
+    private static final int CLICK_GAP         = 5;   // inventory click gap
     private static final int SELL_SYNC_WAIT    = 8;   // wait for server slot update before selling
     private static final int SLOT_TIMEOUT      = 20;  // give up waiting for a slot change
 
@@ -325,7 +330,7 @@ public class SpruceFastClient implements ClientModInitializer {
         dialogScreen = null;
         orderFilled = false;
         setPhase(Phase.ORDER_GUI);
-        cooldown = MENU_CLICK_DELAY;
+        cooldown = ORDER_SPEED_TICKS;
     }
 
     /*
@@ -375,14 +380,14 @@ public class SpruceFastClient implements ClientModInitializer {
             if (s != -1) {
                 click(c, h, s, SlotActionType.PICKUP);
                 orderStep = 2;
-                cooldown = MENU_CLICK_DELAY;
+                cooldown = ORDER_SPEED_TICKS;
                 return;
             }
 
             s = find(h, cs, "your orders");
             if (s != -1 && clickOnce(c, hs, h, s)) {
                 orderStep = 1;
-                cooldown = MENU_CLICK_DELAY;
+                cooldown = ORDER_SPEED_TICKS;
             }
 
             return;
@@ -469,12 +474,12 @@ public class SpruceFastClient implements ClientModInitializer {
         }
 
         lastPressTick = tickCounter;
-        cooldown = MENU_CLICK_DELAY;
+        cooldown = ORDER_SPEED_TICKS;
     }
 
     private static void orderWait(MinecraftClient c) {
 
-        if (orderFilled && phaseTicks >= 40) {
+        if (orderFilled && phaseTicks >= 4) {
             setPhase(Phase.COLLECT_CMD);
             return;
         }
@@ -566,7 +571,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
             if (quickMoveAllNow(c, h, 0, cs, JOB_ITEM)) {
                 movedAny = true;
-                cooldown = MENU_CLICK_DELAY;
+                cooldown = ORDER_COLLECT_SPEED_TICKS;
             } else if (movedAny) {
                 finishCollect(c, count(c, JOB_ITEM) - itemsAtCollectStart);
             }
@@ -628,7 +633,7 @@ public class SpruceFastClient implements ClientModInitializer {
 
         if (clickOnce(c, hs, h, s)) {
             LOG.info("[COLLECT] '{}' -> clicked slot {}", title, s);
-            cooldown = MENU_CLICK_DELAY;
+            cooldown = ORDER_COLLECT_SPEED_TICKS;
         }
     }
 
@@ -1096,7 +1101,7 @@ public class SpruceFastClient implements ClientModInitializer {
             }
         }
 
-        /* 1) ANY hotbar slot holding a water bucket -> hold it.
+        /* 1) ANY hotbar slot holding a water bucket -> sell it immediately.
               Scans all 9 every pass, no fragile round-robin state. */
         int hb = -1;
         for (int i = 0; i < 9; i++) {
@@ -1110,7 +1115,9 @@ public class SpruceFastClient implements ClientModInitializer {
             bucketIdle = 0;
             lastHotbar = hb;
             c.player.getInventory().setSelectedSlot(hb);
-            cooldown = SELL_SYNC_WAIT;                   // let the server see the new held slot
+            // Already holding the water bucket: sell immediately.
+            // Do not add the old sync wait here; the held-slot check in bucketSellCmd is the guard.
+            cooldown = 0;
             setPhase(Phase.B_SELL_CMD);
             return;
         }
