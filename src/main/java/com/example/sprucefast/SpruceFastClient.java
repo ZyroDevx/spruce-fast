@@ -53,6 +53,7 @@ import java.util.Locale;
  * Bucket cycle (key: DELETE = start / stop):
  *   /orders (buy 144 empty buckets) -> wait -> collect
  *   -> put the bucket stacks into the nearby dispensers (water buckets come out)
+ *      (keeps going over the dispensers until NO empty bucket is left in the inventory)
  *   -> /ah sell water buckets 2% under the cheapest market listing
  *   -> empty the dispensers -> /sell leftovers -> repeat.
  */
@@ -77,6 +78,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final String LIST_PRICE           = "6k";  // water buckets are listed with: /ah sell 6k
     private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
+    private static final int    MAX_LOAD_PASSES       = 8;     // how many times to go over the dispensers to place every empty bucket
     /* ---------------- USER SPEED CONFIG ----------------
        Lower values = faster. 20 ticks = 1 second. */
     private static final int ORDER_SPEED_TICKS             = 4;   // order GUI actions
@@ -768,14 +770,21 @@ public class SpruceFastClient implements ClientModInitializer {
     private static int dispLeft = -1;
     private static int dispClicks = 0;
 
+    // loading: keep going over the dispensers until no empty bucket is left
+    private static int dispPasses = 0;
+    private static int passStartBuckets = 0;
+    private static int passNoProgress = 0;
+
     private static int bucketSold = 0;
     private static int bucketSellTarget = 0;
     private static int bucketIdle = 0;
     private static int bucketFail = 0;
 
-    /* Tracks an inventory slot we SWAP-clicked and are waiting on.
-       The slot is only clicked ONCE - we wait for the server's slot update
-       (the stack changing) before acting again, so no duplicate-click spam. */
+    // pulling water buckets up from the inventory into the hotbar (with the inventory screen open)
+    private static int pullClicks = 0;
+    private static int lastPullTick = -1000;
+
+    /* Old slot-wait marker (kept so other code can reset it). */
     private static int pendingInvSlot = -1;
     private static int pendingSince = 0;
 
@@ -876,6 +885,19 @@ public class SpruceFastClient implements ClientModInitializer {
         return n;
     }
 
+    /** Spreads the empty-bucket stacks that are STILL in the inventory over the dispensers. */
+    private static void assignStacks(MinecraftClient c) {
+
+        int stacks = bucketStacks(c);
+
+        dispAssign = new int[dispensers.size()];
+        for (int i = 0; i < stacks; i++) {
+            dispAssign[i % dispensers.size()]++;
+        }
+
+        passStartBuckets = count(c, Items.BUCKET);
+    }
+
     /** empty = false: put the empty-bucket stacks into the dispensers. empty = true: take everything out. */
     private static void beginDispensers(MinecraftClient c, boolean empty) {
 
@@ -890,15 +912,12 @@ public class SpruceFastClient implements ClientModInitializer {
                 return;
             }
 
-            // spread the stacks over the dispensers (9 stacks + 9 dispensers = one each)
-            int stacks = bucketStacks(c);
-            dispAssign = new int[dispensers.size()];
-            for (int i = 0; i < stacks; i++) {
-                dispAssign[i % dispensers.size()]++;
-            }
+            dispPasses = 0;
+            passNoProgress = 0;
+            assignStacks(c);
 
             bucketSellTarget = Math.max(0, BUCKET_ORDER_AMOUNT - STUCK_BUCKETS);
-            LOG.info("Dispensers: {} ({} bucket stacks) sell target {}", dispensers, stacks, bucketSellTarget);
+            LOG.info("Dispensers: {} ({} bucket stacks) sell target {}", dispensers, bucketStacks(c), bucketSellTarget);
         }
 
         dispIdx = 0;
@@ -1046,14 +1065,22 @@ public class SpruceFastClient implements ClientModInitializer {
             int slot = -1;
 
             if (!dispEmptyMode) {
-                // put this dispenser's share of bucket stacks in (one shift-click at a time)
+                // put this dispenser's share of bucket stacks in (one shift-click at a time).
+                // Take them from ANYWHERE in the inventory (hotbar first), not only the hotbar:
+                // water buckets that the running dispensers throw back can fill hotbar slots.
                 if (dispLeft > 0) {
-                    // Buckets were deliberately organized into the hotbar first.
-                    // Only take from hotbar here, so no bucket is left hidden in the main inventory.
-                    for (int i = 36; i <= 44 && i < h.slots.size(); i++) {
+                    for (int i = Math.min(36, h.slots.size()); i <= 44 && i < h.slots.size(); i++) {
                         if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
                             slot = i;
                             break;
+                        }
+                    }
+                    if (slot == -1) {
+                        for (int i = cs; i < Math.min(36, h.slots.size()); i++) {
+                            if (h.getSlot(i).getStack().isOf(Items.BUCKET)) {
+                                slot = i;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1106,13 +1133,41 @@ public class SpruceFastClient implements ClientModInitializer {
             return;
         }
 
+        /*
+         * One pass over all dispensers is done. The dispensers start throwing water buckets the moment
+         * they get the first stack, so some empty buckets can still be left (full dispensers, a slot that
+         * was busy, lag ...). KEEP GOING over the dispensers until there is no empty bucket left.
+         */
+        int left = count(c, Items.BUCKET);
+
+        if (left > 0) {
+
+            passNoProgress = (left < passStartBuckets) ? 0 : passNoProgress + 1;
+
+            if (dispPasses + 1 < MAX_LOAD_PASSES && passNoProgress < 3) {
+                dispPasses++;
+                info(c, left + " empty buckets still in the inventory - loading them again (pass " + (dispPasses + 1) + ")...");
+                assignStacks(c);
+                dispIdx = 0;
+                dispStage = 0;
+                dispActed = false;
+                dispRetries = 0;
+                setPhase(Phase.B_DISP_OPEN);
+                cooldown = DISPENSER_BUCKET_SPEED_TICKS * 2;
+                return;
+            }
+
+            info(c, "Could not place the last " + left + " empty buckets (dispensers full?). Selling anyway.");
+        }
+
         bucketSold = 0;
         bucketIdle = 0;
         bucketFail = 0;
         lastHotbar = -1;
         pendingInvSlot = -1;
+        pullClicks = 0;
         strafeOrigin = new Vec3d(c.player.getX(), c.player.getY(), c.player.getZ());
-        info(c, "Dispensers loaded. Selling water buckets on the AH...");
+        info(c, "All empty buckets are in the dispensers. Selling water buckets on the AH...");
         setPhase(Phase.B_SELL_FIND);
     }
 
@@ -1129,11 +1184,21 @@ public class SpruceFastClient implements ClientModInitializer {
         return -1;
     }
 
-    /** First EMPTY hotbar slot (0-8), or -1. */
-    private static int emptyHotbar(MinecraftClient c) {
-        PlayerScreenHandler h = c.player.playerScreenHandler;
+    /** First hotbar index (0-8) holding a water bucket, or -1. */
+    private static int firstHotbarWater(PlayerScreenHandler h) {
+        for (int i = 0; i < 9; i++) {
+            if (h.getSlot(36 + i).getStack().isOf(Items.WATER_BUCKET)) return i;
+        }
+        return -1;
+    }
+
+    /** Hotbar slot that can receive a water bucket: an EMPTY one, else any slot that is not already a water bucket. */
+    private static int pullTarget(PlayerScreenHandler h) {
         for (int i = 0; i < 9; i++) {
             if (h.getSlot(36 + i).getStack().isEmpty()) return i;
+        }
+        for (int i = 0; i < 9; i++) {
+            if (!h.getSlot(36 + i).getStack().isOf(Items.WATER_BUCKET)) return i;
         }
         return -1;
     }
@@ -1141,61 +1206,67 @@ public class SpruceFastClient implements ClientModInitializer {
     private static void bucketSellFind(MinecraftClient c) {
 
         if (bucketSold >= bucketSellTarget) {
+            if (c.currentScreen instanceof InventoryScreen) {
+                c.player.closeHandledScreen();
+            }
             finishBucketSelling(c);
             return;
         }
 
         PlayerScreenHandler h = c.player.playerScreenHandler;
-        int syncId = h.syncId;
+        int invSlot = inventoryWaterSlot(c);
+        int target = pullTarget(h);
 
-        /* 0) We clicked a swap recently -> WAIT until the slot actually changes.
-              Clicking again now would spam the server and get you kicked. */
-        if (pendingInvSlot != -1) {
-            if (tickCounter - pendingSince > SLOT_TIMEOUT) {
-                pendingInvSlot = -1;                     // server never confirmed - retry fresh
-            } else if (h.getSlot(pendingInvSlot).getStack().isOf(Items.WATER_BUCKET)) {
-                return;                                  // still unchanged - do NOT click again
-            } else {
-                pendingInvSlot = -1;                     // confirmed - carry on
+        /*
+         * A) The inventory screen is open: pull water buckets up into the hotbar like a real player does.
+         *    (Swapping slots with NO inventory open is what the server ignored - the bucket looked like it
+         *    was in the hotbar on our side, but the server never moved it, so /ah sell had nothing to sell.)
+         */
+        if (c.currentScreen instanceof InventoryScreen) {
+
+            if (invSlot != -1 && target != -1 && pullClicks < 12) {
+                c.interactionManager.clickSlot(h.syncId, invSlot, target, SlotActionType.SWAP, c.player);
+                pullClicks++;
+                lastPullTick = tickCounter;
+                cooldown = CLICK_GAP;
+                return;
             }
+
+            // nothing more to pull: give the server a moment to confirm the moves, then close the inventory
+            if (tickCounter - lastPullTick < SELL_SYNC_WAIT) {
+                return;
+            }
+
+            c.player.closeHandledScreen();
+            pullClicks = 0;
+            cooldown = 3;
+            return;
         }
 
-        /* 1) ANY hotbar slot holding a water bucket -> sell it immediately.
-              Scans all 9 every pass, no fragile round-robin state. */
-        int hb = -1;
-        for (int i = 0; i < 9; i++) {
-            if (h.getSlot(36 + i).getStack().isOf(Items.WATER_BUCKET)) {
-                hb = i;
-                break;
-            }
-        }
+        /* B) ANY hotbar slot holding a water bucket -> sell it right away. */
+        int hb = firstHotbarWater(h);
 
         if (hb != -1) {
             bucketIdle = 0;
             lastHotbar = hb;
             c.player.getInventory().setSelectedSlot(hb);
-            // Already holding the water bucket: sell immediately.
-            // Do not add the old sync wait here; the held-slot check in bucketSellCmd is the guard.
-            cooldown = 0;
+            // The new selected slot reaches the server on the next tick, and the command is sent after that.
+            cooldown = 1;
             setPhase(Phase.B_SELL_CMD);
             return;
         }
 
-        /* 2) Nothing in the hotbar -> pull ONE bucket up from the inventory. */
-        int invSlot = inventoryWaterSlot(c);
-        if (invSlot != -1) {
-            int emptyHb = emptyHotbar(c);
-            int target = emptyHb != -1
-                    ? emptyHb
-                    : c.player.getInventory().getSelectedSlot();
-            c.interactionManager.clickSlot(syncId, invSlot, target, SlotActionType.SWAP, c.player);
-            pendingInvSlot = invSlot;
-            pendingSince = tickCounter;
-            cooldown = CLICK_GAP;
+        /* C) None in the hotbar but some in the inventory -> open the inventory and pull them up. */
+        if (invSlot != -1 && target != -1) {
+            bucketIdle = 0;
+            c.setScreen(new InventoryScreen(c.player));
+            pullClicks = 0;
+            lastPullTick = tickCounter;
+            cooldown = 3;
             return;
         }
 
-        /* 3) Nothing anywhere -> wait for dispensers to convert more. */
+        /* D) Nothing anywhere -> wait for the dispensers to produce more. */
         bucketIdle++;
 
         if (bucketIdle > BUCKET_IDLE_TICKS) {
