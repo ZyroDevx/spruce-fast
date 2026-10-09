@@ -80,7 +80,7 @@ public class SpruceFastClient implements ClientModInitializer {
     private static final int    BUCKET_MIN_FREE_SLOTS = 9;     // 144 buckets = 9 stacks
     private static final int    MAX_DISPENSERS        = 9;     // use the nearest N dispensers
     private static final double DISPENSER_REACH       = 4.3;   // max eye-to-dispenser distance
-    private static final String LIST_PRICE            = "8700"; // 8.7K: water buckets are listed with /ah sell 8700
+    private static final String LIST_PRICE            = "7000"; // 8.7K: water buckets are listed with /ah sell 8700
     private static final int    STUCK_BUCKETS         = 9;     // buckets that stay looping inside the dispensers
     private static final int    BUCKET_IDLE_TICKS     = 20 * 90; // no water bucket for 90 s -> finish
     private static final int    MAX_LOAD_PASSES       = 8;     // how many times to go over the dispensers to place every empty bucket
